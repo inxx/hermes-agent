@@ -11,6 +11,9 @@ Usage:
   python3 hyperliquid_client.py spots [--limit N]
   python3 hyperliquid_client.py candles <coin> [--interval 1h] [--hours 24]
   python3 hyperliquid_client.py funding <coin> [--hours 72]
+  python3 hyperliquid_client.py funding-contract <coin>
+      --start-time-ms N --end-time-ms N
+      --output-dir PATH --authorization-receipt PATH
   python3 hyperliquid_client.py l2 <coin> [--levels 10]
   python3 hyperliquid_client.py state [address] [--dex DEX]
   python3 hyperliquid_client.py spot-balances [address]
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import os
 import sys
@@ -915,6 +919,28 @@ def run_funding(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
+def run_funding_contract(args: argparse.Namespace) -> Dict[str, Any]:
+    """Dispatch the isolated one-shot owner-authorized funding adapter."""
+    adapter_path = Path(__file__).with_name("funding_contract_adapter.py")
+    spec = importlib.util.spec_from_file_location("hermes_funding_contract_adapter", adapter_path)
+    if spec is None or spec.loader is None:
+        sys.exit("Funding contract adapter is unavailable.")
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    try:
+        return adapter.execute_funding_contract(
+            coin=args.coin,
+            start_time_ms=args.start_time_ms,
+            end_time_ms=args.end_time_ms,
+            output_dir=args.output_dir,
+            authorization_receipt=args.authorization_receipt,
+            adapter_path=adapter_path,
+            entrypoint_path=Path(__file__),
+        )
+    except adapter.FundingContractError as exc:
+        sys.exit(f"Hyperliquid funding contract error: {exc}")
+
+
 def run_l2(args: argparse.Namespace) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"type": "l2Book", "coin": args.coin}
     if args.n_sig_figs is not None:
@@ -1529,6 +1555,19 @@ def render_export(data: Dict[str, Any]) -> str:
     )
 
 
+def render_funding_contract(data: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"Status: {data['status']}",
+            f"Output: {data['output_dir']}",
+            f"Request SHA-256: {data['request_sha256']}",
+            f"Raw SHA-256: {data['raw_sha256']}",
+            "Completeness: NOT_PROVEN",
+            "Strategy/trading authority: false",
+        ]
+    )
+
+
 def _add_json_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print raw JSON output")
 
@@ -1578,6 +1617,22 @@ def build_parser() -> argparse.ArgumentParser:
     funding.add_argument("--limit", type=int, default=20, help="Rows to display; 0 means all")
     _add_json_flag(funding)
     funding.set_defaults(func=run_funding, renderer=render_funding)
+
+    funding_contract = subparsers.add_parser(
+        "funding-contract",
+        help="Run a separately authorized one-shot raw funding capture",
+    )
+    funding_contract.add_argument("coin", help="Exact source-native coin identifier")
+    funding_contract.add_argument("--start-time-ms", type=int, required=True)
+    funding_contract.add_argument("--end-time-ms", type=int, required=True)
+    funding_contract.add_argument("--output-dir", required=True, help="New canonical absolute output directory")
+    funding_contract.add_argument(
+        "--authorization-receipt",
+        required=True,
+        help="Owner authorization receipt bound to the exact request and source hashes",
+    )
+    _add_json_flag(funding_contract)
+    funding_contract.set_defaults(func=run_funding_contract, renderer=render_funding_contract)
 
     l2 = subparsers.add_parser("l2", help="Inspect the current L2 book for a market")
     l2.add_argument("coin", help='Coin name, e.g. "BTC" or "PURR/USDC"')

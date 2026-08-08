@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -131,5 +132,72 @@ def test_user_dotenv_overrides_project_dotenv(tmp_path, monkeypatch):
     assert mod._env_lookup("HYPERLIQUID_USER_ADDRESS") == "0xuserhome"
 
 
+def test_legacy_funding_window_and_payload_are_unchanged(monkeypatch):
+    mod = load_module()
+    observed = []
+    monkeypatch.setattr(mod.time, "time", lambda: 10_000.0)
+    monkeypatch.setattr(mod, "_post_info", lambda payload: observed.append(payload) or [])
+
+    args = mod.build_parser().parse_args(["funding", "BTC", "--hours", "2", "--limit", "0"])
+    result = args.func(args)
+
+    assert observed == [
+        {
+            "type": "fundingHistory",
+            "coin": "BTC",
+            "startTime": 10_000_000 - 7_200_000,
+            "endTime": 10_000_000,
+        }
+    ]
+    assert result["hours"] == 2.0
+
+
+def test_legacy_post_info_retry_behavior_is_unchanged(monkeypatch):
+    mod = load_module()
+    calls = []
+
+    def urlopen(_request, timeout):
+        calls.append(timeout)
+        if len(calls) < 3:
+            raise urllib.error.HTTPError(mod._info_url(), 429, "rate limited", {}, None)
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return b"[]"
+
+        return Response()
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(mod.time, "sleep", lambda _seconds: None)
+    assert mod._post_info({"type": "fundingHistory"}) == []
+    assert calls == [20, 20, 20]
+
+
+def test_funding_contract_parser_is_isolated_and_requires_exact_arguments():
+    mod = load_module()
+    parser = mod.build_parser()
+    args = parser.parse_args(
+        [
+            "funding-contract",
+            "BTC",
+            "--start-time-ms",
+            "1000",
+            "--end-time-ms",
+            "4000",
+            "--output-dir",
+            "/tmp/unused-output",
+            "--authorization-receipt",
+            "/tmp/unused-authorization.json",
+        ]
+    )
+    assert args.func is mod.run_funding_contract
+    assert args.start_time_ms == 1000
+    assert args.end_time_ms == 4000
 
 

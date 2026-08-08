@@ -16,8 +16,9 @@ metadata:
 Query Hyperliquid market and account data through the public `/info` endpoint.
 Read-only — no API key, no signing, no order placement.
 
-12 commands: `dexs`, `markets`, `spots`, `candles`, `funding`, `l2`, `state`,
-`spot-balances`, `fills`, `orders`, `review`, `export`. Stdlib only
+13 commands: `dexs`, `markets`, `spots`, `candles`, `funding`,
+`funding-contract`, `l2`, `state`, `spot-balances`, `fills`, `orders`, `review`,
+`export`. Stdlib only
 (`urllib`, `json`, `argparse`).
 
 ---
@@ -70,6 +71,7 @@ hyperliquid_client.py markets [--dex DEX] [--limit N] [--sort volume|oi|funding_
 hyperliquid_client.py spots [--limit N]
 hyperliquid_client.py candles <coin> [--interval 1h] [--hours 24] [--limit N]
 hyperliquid_client.py funding <coin> [--hours 72] [--limit N]
+hyperliquid_client.py funding-contract <coin> --start-time-ms N --end-time-ms N --output-dir PATH --authorization-receipt PATH
 hyperliquid_client.py l2 <coin> [--levels N]
 hyperliquid_client.py state [address] [--dex DEX]
 hyperliquid_client.py spot-balances [address] [--limit N]
@@ -114,6 +116,16 @@ python3 ~/.hermes/skills/blockchain/hyperliquid/scripts/hyperliquid_client.py \
 
 Time-range endpoints paginate. For larger windows, repeat with a later
 `startTime` or use `export` (below).
+
+`funding-contract` is a control-only path for an exact, owner-preregistered
+funding request. It is disabled unless a separate authorization receipt and its
+SHA-256 are supplied through
+`HERMES_FUNDING_CONTRACT_AUTHORIZATION_SHA256`. The receipt binds the command,
+source files, endpoint, request, output namespace, and one-shot consumption
+marker. The authorization is consumed before the single HTTP request; failures
+do not retry or restore it. Raw response bytes are durably published before
+parsing. Its receipt never claims completeness, causal research readiness,
+strategy authority, or trading authority.
 
 ### 3. Inspect Live Order Book
 
