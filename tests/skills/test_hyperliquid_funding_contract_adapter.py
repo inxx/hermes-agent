@@ -101,8 +101,8 @@ class FakeResponse:
     def getcode(self):
         return self.status
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body if size < 0 else self.body[:size]
 
 
 def execute(mod, tmp_path: Path, body: bytes, *, open_once=None):
@@ -214,6 +214,51 @@ def test_json_and_structure_failures_keep_raw_and_never_claim_completeness(tmp_p
     )
     assert result["status"] == "RAW_CAPTURED_STRUCTURE_INVALID"
     receipt = json.loads((output / "receipt.json").read_bytes())
+    assert receipt["claim_boundary"]["completeness_proven"] is False
+
+
+def test_response_body_cap_consumes_authorization_without_publishing_partial_raw(tmp_path):
+    mod = load_module()
+    oversized = b"[" + (b" " * mod.MAX_RESPONSE_BYTES) + b"]"
+    request = mod.build_request("BTC", 1_000, 4_000)
+    output_dir = tmp_path / "capture"
+    authorization, authorization_hash, marker = write_authorization(
+        mod, tmp_path, request=request, output_dir=output_dir
+    )
+    calls = []
+
+    def open_once(request_object, timeout):
+        calls.append((request_object, timeout))
+        return FakeResponse(oversized)
+
+    kwargs = {
+        "coin": "BTC",
+        "start_time_ms": 1_000,
+        "end_time_ms": 4_000,
+        "output_dir": str(output_dir),
+        "authorization_receipt": str(authorization),
+        "authorization_hash": authorization_hash,
+        "adapter_path": ADAPTER_PATH,
+        "entrypoint_path": ENTRYPOINT_PATH,
+        "open_once": open_once,
+    }
+    with pytest.raises(mod.FundingContractError, match="response_cap_exceeded"):
+        mod.execute_funding_contract(**kwargs)
+    assert len(calls) == 1
+    assert marker.exists()
+    assert not (output_dir / "response.raw").exists()
+    with pytest.raises(mod.FundingContractError, match="authorization_already_consumed"):
+        mod.execute_funding_contract(**kwargs)
+    assert len(calls) == 1
+
+
+def test_empty_array_is_review_required_not_structure_valid(tmp_path):
+    mod = load_module()
+    result, calls, _marker, output_dir = execute(mod, tmp_path, canonical_bytes([]))
+    assert len(calls) == 1
+    assert result["status"] == "RAW_CAPTURED_EMPTY_RESPONSE_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED"
+    receipt = json.loads((output_dir / "receipt.json").read_bytes())
+    assert receipt["structure"]["row_count"] == 0
     assert receipt["claim_boundary"]["completeness_proven"] is False
 
 
@@ -398,7 +443,7 @@ def test_existing_finalized_raw_recovers_offline_without_network(tmp_path):
         entrypoint_path=ENTRYPOINT_PATH,
         open_once=lambda *_: calls.append(True),
     )
-    assert result["status"].startswith("RAW_CAPTURED_STRUCTURE_VALID")
+    assert result["status"] == "RAW_CAPTURED_EMPTY_RESPONSE_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED"
     assert calls == []
 
 

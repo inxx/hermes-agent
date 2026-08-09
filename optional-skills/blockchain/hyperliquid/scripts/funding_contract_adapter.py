@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Optional
 ENDPOINT = "https://api.hyperliquid.xyz/info"
 COMMAND = "funding-contract"
 TIMEOUT_SECONDS = 20
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 AUTHORIZATION_SCHEMA = "hermes.hyperliquid.funding-contract-authorization.v2"
 CONSUMPTION_SCHEMA = "hermes.hyperliquid.funding-contract-consumption.v2"
 RECEIPT_SCHEMA = "hermes.hyperliquid.funding-contract-receipt.v2"
@@ -340,13 +341,15 @@ def _capture_once(
             status = int(getattr(response, "status", response.getcode()))
             content_type = response.headers.get("Content-Type", "")
             content_encoding = response.headers.get("Content-Encoding", "")
-            body = response.read()
+            body = response.read(MAX_RESPONSE_BYTES + 1)
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
         raise FundingContractError(f"single_request_failed:{type(exc).__name__}") from exc
     if status != 200:
         raise FundingContractError(f"unexpected_http_status:{status}")
     if not content_type.lower().startswith("application/json"):
         raise FundingContractError("unexpected_content_type")
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise FundingContractError("response_cap_exceeded")
     _publish_bytes(raw_path, body)
     persisted = raw_path.read_bytes()
     if persisted != body:
@@ -544,9 +547,12 @@ def _terminalize_raw(raw_bytes: bytes, request: Dict[str, Any]) -> tuple[str, Di
     try:
         # The caller supplies bytes reopened from the finalized immutable path.
         parsed = json.loads(raw_bytes)
+        summary = _structural_summary(parsed, request)
         return (
-            "RAW_CAPTURED_STRUCTURE_VALID_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED",
-            _structural_summary(parsed, request),
+            "RAW_CAPTURED_EMPTY_RESPONSE_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED"
+            if summary["row_count"] == 0
+            else "RAW_CAPTURED_STRUCTURE_VALID_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED",
+            summary,
         )
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return "RAW_CAPTURED_JSON_INVALID", {
