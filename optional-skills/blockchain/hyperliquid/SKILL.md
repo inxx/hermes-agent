@@ -127,6 +127,17 @@ do not retry or restore it. Raw response bytes are durably published before
 parsing. Its receipt never claims completeness, causal research readiness,
 strategy authority, or trading authority.
 
+`funding_pagination_controller.py` is an offline-only bounded pagination
+controller. It consumes immutable receipts, verifies receipt/request/raw/source
+hash bindings, and emits a review-required next-page intent with
+`network_fetch=false`; it never creates an authorization or opens a socket.
+The cursor is the predecessor maximum event time (not `last_time + 1`) so
+boundary rows are intentionally overlapped. Raw pages are never merged or
+deduplicated. A later aggregate contains only page hashes, row counts, byte
+counts, and time bounds; boundary row-set identity ambiguity, empty pages,
+limits, cycles, and no-progress stop fail closed while completeness remains
+`UNKNOWN/REVIEW_REQUIRED`.
+
 ### 3. Inspect Live Order Book
 
 ```bash

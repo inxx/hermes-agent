@@ -371,6 +371,7 @@ def _structural_summary(payload: Any, request: Dict[str, Any]) -> Dict[str, Any]
     duplicate_count = 0
     conflict_count = 0
     event_times = []
+    rows = []
     for row in payload:
         if not isinstance(row, dict) or set(row) != set(REQUIRED_FIELDS):
             raise FundingContractError("funding_row_schema_invalid")
@@ -398,15 +399,33 @@ def _structural_summary(payload: Any, request: Dict[str, Any]) -> Dict[str, Any]
             identities[identity] = row_bytes
         previous_time = event_time
         event_times.append(event_time)
+        rows.append(row)
     if duplicate_count:
         raise FundingContractError(
             "funding_identity_conflict" if conflict_count else "funding_duplicate_identity"
         )
+    min_event_time = min(event_times) if event_times else None
+    max_event_time = max(event_times) if event_times else None
+
+    def boundary_hash(boundary_time: Optional[int]) -> Optional[str]:
+        if boundary_time is None:
+            return None
+        boundary_rows = [
+            _canonical_json_bytes(row) for row in rows if row["time"] == boundary_time
+        ]
+        return _sha256_bytes(b"[" + b",".join(sorted(boundary_rows)) + b"]")
+
     return {
         "row_count": len(payload),
         "schema": list(REQUIRED_FIELDS),
-        "min_event_time": min(event_times) if event_times else None,
-        "max_event_time": max(event_times) if event_times else None,
+        "min_event_time": min_event_time,
+        "max_event_time": max_event_time,
+        "min_boundary_row_set_sha256": boundary_hash(min_event_time),
+        "max_boundary_row_set_sha256": boundary_hash(max_event_time),
+        "start_boundary_timestamp_ms": min_event_time,
+        "start_boundary_row_set_sha256": boundary_hash(min_event_time),
+        "boundary_timestamp_ms": max_event_time,
+        "boundary_row_set_sha256": boundary_hash(max_event_time),
         "duplicate_count": duplicate_count,
         "conflict_count": conflict_count,
         "gap_count": None,
@@ -486,6 +505,8 @@ def execute_funding_contract(
                 summary=summary,
                 terminal_status=terminal_status,
                 acquisition_kind="OFFLINE_RECOVERY",
+                adapter_path=adapter_path,
+                entrypoint_path=entrypoint_path,
             )
             _publish_bytes(receipt_path, _canonical_json_bytes(receipt) + b"\n")
             return _result(receipt, target_dir, request_path, recovery_raw, receipt_path)
@@ -538,6 +559,8 @@ def execute_funding_contract(
         terminal_status=terminal_status,
         acquisition_kind=acquisition_kind,
         predecessor=predecessor,
+        adapter_path=adapter_path,
+        entrypoint_path=entrypoint_path,
     )
     _publish_bytes(receipt_path, _canonical_json_bytes(receipt) + b"\n")
     return _result(receipt, target_dir, request_path, raw_path, receipt_path)
@@ -559,6 +582,12 @@ def _terminalize_raw(raw_bytes: bytes, request: Dict[str, Any]) -> tuple[str, Di
             "row_count": None, "schema": None, "min_event_time": None,
             "max_event_time": None, "duplicate_count": None,
             "conflict_count": None, "gap_count": None,
+            "min_boundary_row_set_sha256": None,
+            "max_boundary_row_set_sha256": None,
+            "start_boundary_timestamp_ms": None,
+            "start_boundary_row_set_sha256": None,
+            "boundary_timestamp_ms": None,
+            "boundary_row_set_sha256": None,
             "completeness_status": "UNKNOWN/REVIEW_REQUIRED",
             "technical_error": str(exc),
         }
@@ -567,6 +596,12 @@ def _terminalize_raw(raw_bytes: bytes, request: Dict[str, Any]) -> tuple[str, Di
             "row_count": None, "schema": None, "min_event_time": None,
             "max_event_time": None, "duplicate_count": None,
             "conflict_count": None, "gap_count": None,
+            "min_boundary_row_set_sha256": None,
+            "max_boundary_row_set_sha256": None,
+            "start_boundary_timestamp_ms": None,
+            "start_boundary_row_set_sha256": None,
+            "boundary_timestamp_ms": None,
+            "boundary_row_set_sha256": None,
             "completeness_status": "UNKNOWN/REVIEW_REQUIRED",
             "technical_error": str(exc),
         }
@@ -585,6 +620,8 @@ def _build_receipt(
     terminal_status,
     acquisition_kind,
     predecessor=None,
+    adapter_path,
+    entrypoint_path,
 ):
     return {
         "schema_version": RECEIPT_SCHEMA,
@@ -608,6 +645,8 @@ def _build_receipt(
             "revision_number": authorization["revision_number"],
             "acquisition_id": authorization["authorization_id"],
             "acquisition_kind": acquisition_kind,
+            "adapter_sha256": _source_sha256(adapter_path),
+            "entrypoint_sha256": _source_sha256(entrypoint_path),
         },
         "transport": {
             "http_requests": 0 if acquisition_kind == "OFFLINE_RECOVERY" else 1,
