@@ -136,6 +136,15 @@ wall clock. Its receipt keeps source availability, native sequencing,
 completeness, realtime, causal, strategy, and trading claims unknown or false;
 it never calls `hyperliquid_client.py`.
 
+`scripts/candle_clock_bound_collector.py` is the finite scheduler bridge for
+that adapter. It is intended only for Hermes `no_agent=True` cron and requires
+an exact-hash owner contract containing no more than 16 contiguous 15-minute
+slot boundaries. Each due slot creates one fresh run intent and performs at
+most one public raw request through the exact loopback proxy. Existing partial
+namespaces fail without retry; completed slots are silent. The collector does
+not project a shadow stream, evaluate a strategy, create a candidate, or carry
+paper/live/order/capital/interlock authority.
+
 `funding_pagination_controller.py` is an offline-only bounded pagination
 controller. It consumes immutable receipts, verifies exact receipt-file,
 request, raw, and source bindings through single `O_NOFOLLOW` regular-file
