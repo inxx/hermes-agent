@@ -127,6 +127,15 @@ do not retry or restore it. Raw response bytes are durably published before
 parsing. Its receipt never claims completeness, causal research readiness,
 strategy authority, or trading authority.
 
+`scripts/candle_raw_capture_adapter.py` is the separate BTC-only raw candle
+path. It requires an exact-hash owner run-intent, denies credential-bearing
+environment variables before opening a socket, performs one `candleSnapshot`
+request with zero retries and redirects, durably stores request/response bytes,
+and records only candles whose `T` is earlier than the local request-start
+wall clock. Its receipt keeps source availability, native sequencing,
+completeness, realtime, causal, strategy, and trading claims unknown or false;
+it never calls `hyperliquid_client.py`.
+
 `funding_pagination_controller.py` is an offline-only bounded pagination
 controller. It consumes immutable receipts, verifies exact receipt-file,
 request, raw, and source bindings through single `O_NOFOLLOW` regular-file
