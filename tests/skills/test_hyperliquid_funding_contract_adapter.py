@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import urllib.error
 from pathlib import Path
@@ -43,7 +44,17 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def write_authorization(mod, tmp_path: Path, *, request: dict, output_dir: Path):
+def write_authorization(
+    mod,
+    tmp_path: Path,
+    *,
+    request: dict,
+    output_dir: Path,
+    revision=1,
+    predecessor=None,
+    network_fetch=True,
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     marker = tmp_path / "authorization-consumed.json"
     payload = {
         "schema_version": mod.AUTHORIZATION_SCHEMA,
@@ -54,13 +65,18 @@ def write_authorization(mod, tmp_path: Path, *, request: dict, output_dir: Path)
         "request_sha256": sha256_bytes(canonical_bytes(request)),
         "coin": request["coin"],
         "start_time_ms": request["startTime"],
-        "end_time_ms": request["endTime"],
+        "end_time_ms": request["endTime"] + 1,
+        "local_end_exclusive_ms": request["endTime"] + 1,
+        "wire_end_inclusive_ms": request["endTime"],
         "output_dir": str(output_dir),
         "consumption_marker_path": str(marker),
         "maximum_http_requests": 1,
         "adapter_sha256": sha256_bytes(ADAPTER_PATH.read_bytes()),
         "entrypoint_sha256": sha256_bytes(ENTRYPOINT_PATH.read_bytes()),
-        "network_fetch": True,
+        "network_fetch": network_fetch,
+        "revision_number": revision,
+        "predecessor_receipt_path": str(predecessor[0]) if predecessor else None,
+        "predecessor_receipt_sha256": predecessor[1] if predecessor else None,
         "authorities": {key: False for key in mod.AUTHORITY_KEYS},
     }
     raw = canonical_bytes(payload) + b"\n"
@@ -148,16 +164,20 @@ def test_exact_wire_bytes_raw_first_and_performance_blind_receipt(tmp_path, monk
     }
     assert sent_request.full_url == mod.ENDPOINT
     assert sent_request.method == "POST"
+    expected_request["endTime"] = 3_999
     assert sent_request.data == canonical_bytes(expected_request)
     assert (output_dir / "request.json").read_bytes() == sent_request.data
     assert timeout == mod.TIMEOUT_SECONDS
     assert marker.exists()
-    assert result["status"] == "RAW_ACQUIRED_STRUCTURE_PASS_COMPLETENESS_NOT_PROVEN"
+    assert result["status"] == "RAW_CAPTURED_STRUCTURE_VALID_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED"
+    assert "PASS" not in result["status"]
 
     receipt = json.loads((output_dir / "receipt.json").read_bytes())
     assert receipt["transport"]["http_requests"] == 1
     assert receipt["transport"]["automatic_retries"] == 0
-    assert receipt["structure"]["completeness_status"] == "NOT_PROVEN"
+    assert receipt["structure"]["completeness_status"] == "UNKNOWN/REVIEW_REQUIRED"
+    assert receipt["request"]["end_time_exclusive_ms"] == 4_000
+    assert receipt["request"]["wire_end_inclusive_ms"] == 3_999
     assert receipt["claim_boundary"]["strategy_authorized"] is False
     rendered = json.dumps(receipt, sort_keys=True)
     for forbidden in ("0.0001", "-0.0001", "average", "return", "profit"):
@@ -195,6 +215,18 @@ def test_json_and_structure_failures_keep_raw_and_never_claim_completeness(tmp_p
     assert result["status"] == "RAW_CAPTURED_STRUCTURE_INVALID"
     receipt = json.loads((output / "receipt.json").read_bytes())
     assert receipt["claim_boundary"]["completeness_proven"] is False
+
+
+def test_end_boundary_is_sealed_then_fails_closed(tmp_path):
+    mod = load_module()
+    body = canonical_bytes([{"coin": "BTC", "fundingRate": "0.1", "premium": "0.2", "time": 4_000}])
+    result, calls, _marker, output_dir = execute(mod, tmp_path, body)
+    assert len(calls) == 1
+    assert (output_dir / "response.raw").read_bytes() == body
+    assert result["status"] == "RAW_CAPTURED_STRUCTURE_INVALID"
+    receipt = json.loads((output_dir / "receipt.json").read_bytes())
+    assert "funding_row_outside_half_open_window" in receipt["structure"]["technical_error"]
+    assert receipt["claim_boundary"]["promotable"] is False
 
 
 def test_http_failure_consumes_authorization_and_cannot_retry(tmp_path):
@@ -250,7 +282,10 @@ def test_preflight_binding_or_output_collision_never_calls_transport(tmp_path):
         "entrypoint_path": ENTRYPOINT_PATH,
         "open_once": lambda *_args: calls.append(True),
     }
-    with pytest.raises(mod.FundingContractError, match="authorization_binding_mismatch:request_sha256"):
+    with pytest.raises(
+        mod.FundingContractError,
+        match="authorization_binding_mismatch:request_sha256",
+    ):
         mod.execute_funding_contract(**{**kwargs, "coin": "ETH"})
     assert calls == []
     assert not marker.exists()
@@ -260,6 +295,159 @@ def test_preflight_binding_or_output_collision_never_calls_transport(tmp_path):
         mod.execute_funding_contract(**kwargs)
     assert calls == []
     assert not marker.exists()
+
+
+def test_revision_requires_integrity_and_distinguishes_replay(tmp_path):
+    mod = load_module()
+    body = canonical_bytes([{"coin": "BTC", "fundingRate": "0.1", "premium": "0.2", "time": 1_000}])
+    first, _calls, _marker, first_dir = execute(mod, tmp_path / "first", body)
+    first_receipt = Path(first["receipt_path"])
+    predecessor = (first_receipt, sha256_bytes(first_receipt.read_bytes()))
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    request = mod.build_request("BTC", 1_000, 4_000)
+    output = second_root / "capture"
+    auth, auth_hash, _ = write_authorization(
+        mod,
+        second_root,
+        request=request,
+        output_dir=output,
+        revision=2,
+        predecessor=predecessor,
+    )
+    result = mod.execute_funding_contract(
+        coin="BTC",
+        start_time_ms=1_000,
+        end_time_ms=4_000,
+        output_dir=str(output),
+        authorization_receipt=str(auth),
+        authorization_hash=auth_hash,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        open_once=lambda *_: FakeResponse(body),
+    )
+    assert result["status"] == "RAW_REPLAY_IDENTICAL_REVIEW_REQUIRED"
+    receipt = json.loads(Path(result["receipt_path"]).read_bytes())
+    assert receipt["authorization"]["acquisition_kind"] == "SOURCE_REOBSERVATION"
+
+
+def test_revision_changed_raw_is_immutable_review(tmp_path):
+    mod = load_module()
+    body = canonical_bytes([{"coin": "BTC", "fundingRate": "0.1", "premium": "0.2", "time": 1_000}])
+    first, _calls, _marker, _dir = execute(mod, tmp_path / "first", body)
+    receipt = Path(first["receipt_path"])
+    root = tmp_path / "second"
+    root.mkdir()
+    request = mod.build_request("BTC", 1_000, 4_000)
+    output = root / "capture"
+    auth, auth_hash, _ = write_authorization(
+        mod,
+        root,
+        request=request,
+        output_dir=output,
+        revision=2,
+        predecessor=(receipt, sha256_bytes(receipt.read_bytes())),
+    )
+    changed = canonical_bytes(
+        [{"coin": "BTC", "fundingRate": "0.9", "premium": "0.2", "time": 1_000}]
+    )
+    result = mod.execute_funding_contract(
+        coin="BTC",
+        start_time_ms=1_000,
+        end_time_ms=4_000,
+        output_dir=str(output),
+        authorization_receipt=str(auth),
+        authorization_hash=auth_hash,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        open_once=lambda *_: FakeResponse(changed),
+    )
+    assert result["status"] == "SOURCE_REVISION_REVIEW_REQUIRED"
+
+
+def test_existing_finalized_raw_recovers_offline_without_network(tmp_path):
+    mod = load_module()
+    request = mod.build_request("BTC", 1_000, 4_000)
+    output = tmp_path / "capture"
+    output.mkdir()
+    body = canonical_bytes([])
+    (output / "request.json").write_bytes(canonical_bytes(request))
+    (output / "response.raw").write_bytes(body)
+    auth, auth_hash, marker = write_authorization(
+        mod, tmp_path, request=request, output_dir=output, network_fetch=True
+    )
+    mod._write_exclusive_marker(
+        marker,
+        {
+            "schema_version": mod.CONSUMPTION_SCHEMA,
+            "authorization_id": json.loads(auth.read_bytes())["authorization_id"],
+            "authorization_sha256": auth_hash,
+            "request_sha256": sha256_bytes(canonical_bytes(request)),
+            "state": "CONSUMED_BEFORE_HTTP",
+        },
+    )
+    calls = []
+    result = mod.execute_funding_contract(
+        coin="BTC",
+        start_time_ms=1_000,
+        end_time_ms=4_000,
+        output_dir=str(output),
+        authorization_receipt=str(auth),
+        authorization_hash=auth_hash,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        open_once=lambda *_: calls.append(True),
+    )
+    assert result["status"].startswith("RAW_CAPTURED_STRUCTURE_VALID")
+    assert calls == []
+
+
+def test_existing_raw_without_consumption_marker_cannot_recover(tmp_path):
+    mod = load_module()
+    request = mod.build_request("BTC", 1_000, 4_000)
+    output = tmp_path / "capture"
+    output.mkdir()
+    (output / "request.json").write_bytes(canonical_bytes(request))
+    (output / "response.raw").write_bytes(canonical_bytes([]))
+    auth, auth_hash, _ = write_authorization(
+        mod, tmp_path, request=request, output_dir=output
+    )
+    with pytest.raises(mod.FundingContractError, match="consumption_marker_missing_or_invalid"):
+        mod.execute_funding_contract(
+            coin="BTC",
+            start_time_ms=1_000,
+            end_time_ms=4_000,
+            output_dir=str(output),
+            authorization_receipt=str(auth),
+            authorization_hash=auth_hash,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            open_once=lambda *_: pytest.fail("network must not run"),
+        )
+
+
+def test_symlink_output_path_is_rejected_before_transport(tmp_path):
+    mod = load_module()
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "capture"
+    os.symlink(real, link)
+    request = mod.build_request("BTC", 1_000, 4_000)
+    auth, auth_hash, _ = write_authorization(mod, tmp_path, request=request, output_dir=link)
+    calls = []
+    with pytest.raises(mod.FundingContractError, match="authorization_path_not_canonical"):
+        mod.execute_funding_contract(
+            coin="BTC",
+            start_time_ms=1_000,
+            end_time_ms=4_000,
+            output_dir=str(link),
+            authorization_receipt=str(auth),
+            authorization_hash=auth_hash,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            open_once=lambda *_: calls.append(True),
+        )
+    assert calls == []
 
 
 @pytest.mark.parametrize(

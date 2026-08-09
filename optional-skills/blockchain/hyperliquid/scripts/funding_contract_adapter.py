@@ -7,7 +7,6 @@ authorization receipt is required before its single HTTP request can run.
 """
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 import os
@@ -20,8 +19,9 @@ from typing import Any, Callable, Dict, Optional
 ENDPOINT = "https://api.hyperliquid.xyz/info"
 COMMAND = "funding-contract"
 TIMEOUT_SECONDS = 20
-AUTHORIZATION_SCHEMA = "hermes.hyperliquid.funding-contract-authorization.v1"
-RECEIPT_SCHEMA = "hermes.hyperliquid.funding-contract-receipt.v1"
+AUTHORIZATION_SCHEMA = "hermes.hyperliquid.funding-contract-authorization.v2"
+CONSUMPTION_SCHEMA = "hermes.hyperliquid.funding-contract-consumption.v2"
+RECEIPT_SCHEMA = "hermes.hyperliquid.funding-contract-receipt.v2"
 AUTHORIZATION_HASH_ENV = "HERMES_FUNDING_CONTRACT_AUTHORIZATION_SHA256"
 REQUIRED_FIELDS = ("coin", "fundingRate", "premium", "time")
 AUTHORITY_KEYS = (
@@ -43,6 +43,8 @@ AUTHORIZATION_KEYS = {
     "endpoint",
     "source_contract_sha256",
     "request_sha256",
+    "local_end_exclusive_ms",
+    "wire_end_inclusive_ms",
     "coin",
     "start_time_ms",
     "end_time_ms",
@@ -52,6 +54,9 @@ AUTHORIZATION_KEYS = {
     "adapter_sha256",
     "entrypoint_sha256",
     "network_fetch",
+    "revision_number",
+    "predecessor_receipt_path",
+    "predecessor_receipt_sha256",
     "authorities",
 }
 
@@ -120,7 +125,7 @@ def _write_exclusive_marker(path: Path, payload: Dict[str, Any]) -> None:
 
 def _publish_bytes(path: Path, data: bytes) -> None:
     """Publish complete bytes without overwriting an existing final path."""
-    if path.exists():
+    if path.exists() or path.is_symlink():
         raise FundingContractError(f"output_collision:{path.name}")
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
@@ -159,7 +164,9 @@ def build_request(coin: str, start_time_ms: int, end_time_ms: int) -> Dict[str, 
         raise FundingContractError("invalid_half_open_window")
     return {
         "coin": coin,
-        "endTime": end_time_ms,
+        # Hyperliquid's wire endTime is inclusive; the contract's local end is
+        # exclusive.  Bind both values in authorization and receipts.
+        "endTime": end_time_ms - 1,
         "startTime": start_time_ms,
         "type": "fundingHistory",
     }
@@ -195,7 +202,9 @@ def _load_authorization(
         "request_sha256": _sha256_bytes(request_bytes),
         "coin": request["coin"],
         "start_time_ms": request["startTime"],
-        "end_time_ms": request["endTime"],
+        "end_time_ms": request["endTime"] + 1,
+        "local_end_exclusive_ms": request["endTime"] + 1,
+        "wire_end_inclusive_ms": request["endTime"],
         "output_dir": str(output_dir),
         "maximum_http_requests": 1,
         "adapter_sha256": _source_sha256(adapter_path),
@@ -204,6 +213,8 @@ def _load_authorization(
     for key, value in required.items():
         if authorization.get(key) != value:
             raise FundingContractError(f"authorization_binding_mismatch:{key}")
+    if authorization["wire_end_inclusive_ms"] != authorization["local_end_exclusive_ms"] - 1:
+        raise FundingContractError("boundary_relation_invalid")
     authorization_id = authorization.get("authorization_id")
     if not isinstance(authorization_id, str) or not authorization_id:
         raise FundingContractError("authorization_id_missing")
@@ -217,7 +228,90 @@ def _load_authorization(
     if any(authorities.get(key) is not False for key in AUTHORITY_KEYS):
         raise FundingContractError("non_acquisition_authority_present")
     marker = _canonical_absolute_path(authorization.get("consumption_marker_path"))
+    revision = authorization.get("revision_number")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise FundingContractError("revision_number_invalid")
+    predecessor_path = authorization.get("predecessor_receipt_path")
+    predecessor_hash = authorization.get("predecessor_receipt_sha256")
+    if revision == 1:
+        if predecessor_path is not None or predecessor_hash is not None:
+            raise FundingContractError("predecessor_for_initial_revision")
+    else:
+        _canonical_absolute_path(predecessor_path)
+        if not _is_sha256(predecessor_hash):
+            raise FundingContractError("predecessor_receipt_sha256_invalid")
     return authorization, actual_hash, marker
+
+
+def _load_predecessor(
+    authorization: Dict[str, Any], request: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    if authorization["revision_number"] == 1:
+        return None
+    path = _canonical_absolute_path(authorization["predecessor_receipt_path"])
+    try:
+        raw = path.read_bytes()
+        receipt = json.loads(raw)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FundingContractError("predecessor_receipt_unreadable") from exc
+    if _sha256_bytes(raw) != authorization["predecessor_receipt_sha256"]:
+        raise FundingContractError("predecessor_receipt_hash_mismatch")
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != RECEIPT_SCHEMA:
+        raise FundingContractError("predecessor_receipt_invalid")
+    predecessor_revision = receipt.get("authorization", {}).get("revision_number")
+    if predecessor_revision != authorization["revision_number"] - 1:
+        raise FundingContractError("predecessor_revision_not_immediate_successor")
+    request_info = receipt.get("request")
+    if not isinstance(request_info, dict) or request_info.get(
+        "sha256"
+    ) != _sha256_bytes(_canonical_json_bytes(request)):
+        raise FundingContractError("predecessor_request_lineage_mismatch")
+    if (
+        request_info.get("coin") != request["coin"]
+        or request_info.get("start_time_ms") != request["startTime"]
+        or request_info.get("end_time_exclusive_ms") != request["endTime"] + 1
+    ):
+        raise FundingContractError("predecessor_request_lineage_mismatch")
+    raw_info = receipt.get("raw")
+    if not isinstance(raw_info, dict) or not _is_sha256(raw_info.get("sha256")):
+        raise FundingContractError("predecessor_raw_integrity_missing")
+    raw_path = _canonical_absolute_path(raw_info.get("path"))
+    try:
+        raw_bytes = raw_path.read_bytes()
+    except OSError as exc:
+        raise FundingContractError("predecessor_raw_unreadable") from exc
+    if _sha256_bytes(raw_bytes) != raw_info["sha256"]:
+        raise FundingContractError("predecessor_raw_integrity_mismatch")
+    return {
+        "receipt_path": str(path),
+        "receipt_sha256": authorization["predecessor_receipt_sha256"],
+        "raw_path": str(raw_path),
+        "raw_sha256": raw_info["sha256"],
+    }
+
+
+def _verify_consumption_marker(
+    marker_path: Path,
+    *,
+    authorization_id: str,
+    authorization_sha256: str,
+    request_sha256: str,
+) -> None:
+    if marker_path.is_symlink():
+        raise FundingContractError("consumption_marker_symlink_rejected")
+    try:
+        marker = json.loads(marker_path.read_bytes())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise FundingContractError("consumption_marker_missing_or_invalid") from exc
+    expected = {
+        "schema_version": CONSUMPTION_SCHEMA,
+        "authorization_id": authorization_id,
+        "authorization_sha256": authorization_sha256,
+        "request_sha256": request_sha256,
+        "state": "CONSUMED_BEFORE_HTTP",
+    }
+    if marker != expected:
+        raise FundingContractError("consumption_marker_binding_mismatch")
 
 
 def _open_once(request: urllib.request.Request, timeout: int):
@@ -282,7 +376,9 @@ def _structural_summary(payload: Any, request: Dict[str, Any]) -> Dict[str, Any]
         event_time = row.get("time")
         if isinstance(event_time, bool) or not isinstance(event_time, int):
             raise FundingContractError("funding_row_time_invalid")
-        if not request["startTime"] <= event_time < request["endTime"]:
+        # The local contract is [startTime, endExclusive).  Never filter an
+        # out-of-window row: seal first, then fail closed structurally.
+        if not request["startTime"] <= event_time < request["endTime"] + 1:
             raise FundingContractError("funding_row_outside_half_open_window")
         if previous_time is not None and event_time < previous_time:
             raise FundingContractError("funding_rows_not_monotonic")
@@ -310,7 +406,8 @@ def _structural_summary(payload: Any, request: Dict[str, Any]) -> Dict[str, Any]
         "max_event_time": max(event_times) if event_times else None,
         "duplicate_count": duplicate_count,
         "conflict_count": conflict_count,
-        "completeness_status": "NOT_PROVEN",
+        "gap_count": None,
+        "completeness_status": "UNKNOWN/REVIEW_REQUIRED",
     }
 
 
@@ -339,16 +436,64 @@ def execute_funding_contract(
         adapter_path=adapter_path,
         entrypoint_path=entrypoint_path,
     )
+    predecessor = _load_predecessor(authorization, request)
 
-    if marker_path.exists():
-        raise FundingContractError("authorization_already_consumed")
     if marker_path == target_dir or target_dir in marker_path.parents:
         raise FundingContractError("consumption_marker_must_be_outside_output_dir")
     if target_dir.exists():
+        # A crash may leave a durably published raw without its receipt.  This
+        # is recovery only: never make a new network request from that state.
+        recovery_raw = target_dir / "response.raw"
+        recovery_receipt = target_dir / "receipt.json"
+        request_path = target_dir / "request.json"
+        if (
+            recovery_raw.is_file()
+            and not recovery_raw.is_symlink()
+            and request_path.is_file()
+            and not request_path.is_symlink()
+            and not recovery_receipt.exists()
+            and not recovery_receipt.is_symlink()
+        ):
+            _verify_consumption_marker(
+                marker_path,
+                authorization_id=authorization["authorization_id"],
+                authorization_sha256=authorization_sha256,
+                request_sha256=_sha256_bytes(request_bytes),
+            )
+            if request_path.read_bytes() != request_bytes:
+                raise FundingContractError("recovery_request_binding_mismatch")
+            raw_bytes = recovery_raw.read_bytes()
+            capture = {
+                "http_status": None,
+                "content_type": "application/json",
+                "content_encoding": "",
+                "raw_sha256": _sha256_bytes(raw_bytes),
+                "raw_bytes": raw_bytes,
+            }
+            receipt_path = recovery_receipt
+            terminal_status, summary = _terminalize_raw(raw_bytes, request)
+            receipt = _build_receipt(
+                authorization,
+                authorization_sha256,
+                request,
+                request_path,
+                raw_path=recovery_raw,
+                receipt_path=receipt_path,
+                capture=capture,
+                summary=summary,
+                terminal_status=terminal_status,
+                acquisition_kind="OFFLINE_RECOVERY",
+            )
+            _publish_bytes(receipt_path, _canonical_json_bytes(receipt) + b"\n")
+            return _result(receipt, target_dir, request_path, recovery_raw, receipt_path)
+        if marker_path.exists():
+            raise FundingContractError("authorization_already_consumed")
         raise FundingContractError("output_dir_must_not_exist")
+    if marker_path.exists():
+        raise FundingContractError("authorization_already_consumed")
 
     marker = {
-        "schema_version": "hermes.hyperliquid.funding-contract-consumption.v1",
+        "schema_version": CONSUMPTION_SCHEMA,
         "authorization_id": authorization["authorization_id"],
         "authorization_sha256": authorization_sha256,
         "request_sha256": _sha256_bytes(request_bytes),
@@ -366,54 +511,100 @@ def execute_funding_contract(
     receipt_path = target_dir / "receipt.json"
     _publish_bytes(request_path, request_bytes)
     capture = _capture_once(request_bytes, raw_path=raw_path, open_once=open_once)
-    terminal_status = "RAW_CAPTURED_JSON_INVALID"
+    finalized_raw = raw_path.read_bytes()
+    if _sha256_bytes(finalized_raw) != capture["raw_sha256"]:
+        raise FundingContractError("finalized_raw_hash_mismatch")
+    terminal_status, summary = _terminalize_raw(finalized_raw, request)
+    acquisition_kind = "SOURCE_REOBSERVATION" if predecessor else "SOURCE_ACQUISITION"
+    if predecessor:
+        terminal_status = (
+            "RAW_REPLAY_IDENTICAL_REVIEW_REQUIRED"
+            if capture["raw_sha256"] == predecessor["raw_sha256"]
+            else "SOURCE_REVISION_REVIEW_REQUIRED"
+        )
+
+    receipt = _build_receipt(
+        authorization,
+        authorization_sha256,
+        request,
+        request_path,
+        raw_path=raw_path,
+        receipt_path=receipt_path,
+        capture=capture,
+        summary=summary,
+        terminal_status=terminal_status,
+        acquisition_kind=acquisition_kind,
+        predecessor=predecessor,
+    )
+    _publish_bytes(receipt_path, _canonical_json_bytes(receipt) + b"\n")
+    return _result(receipt, target_dir, request_path, raw_path, receipt_path)
+
+
+def _terminalize_raw(raw_bytes: bytes, request: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     try:
-        parsed = json.loads(raw_path.read_bytes())
-        summary = _structural_summary(parsed, request)
-        terminal_status = "RAW_ACQUIRED_STRUCTURE_PASS_COMPLETENESS_NOT_PROVEN"
+        # The caller supplies bytes reopened from the finalized immutable path.
+        parsed = json.loads(raw_bytes)
+        return (
+            "RAW_CAPTURED_STRUCTURE_VALID_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED",
+            _structural_summary(parsed, request),
+        )
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        summary = {
-            "row_count": None,
-            "schema": None,
-            "min_event_time": None,
-            "max_event_time": None,
-            "duplicate_count": None,
-            "conflict_count": None,
-            "completeness_status": "NOT_PROVEN",
+        return "RAW_CAPTURED_JSON_INVALID", {
+            "row_count": None, "schema": None, "min_event_time": None,
+            "max_event_time": None, "duplicate_count": None,
+            "conflict_count": None, "gap_count": None,
+            "completeness_status": "UNKNOWN/REVIEW_REQUIRED",
             "technical_error": str(exc),
         }
     except FundingContractError as exc:
-        terminal_status = "RAW_CAPTURED_STRUCTURE_INVALID"
-        summary = {
-            "row_count": None,
-            "schema": None,
-            "min_event_time": None,
-            "max_event_time": None,
-            "duplicate_count": None,
-            "conflict_count": None,
-            "completeness_status": "NOT_PROVEN",
+        return "RAW_CAPTURED_STRUCTURE_INVALID", {
+            "row_count": None, "schema": None, "min_event_time": None,
+            "max_event_time": None, "duplicate_count": None,
+            "conflict_count": None, "gap_count": None,
+            "completeness_status": "UNKNOWN/REVIEW_REQUIRED",
             "technical_error": str(exc),
         }
 
-    receipt = {
+
+def _build_receipt(
+    authorization,
+    authorization_sha256,
+    request,
+    request_path,
+    *,
+    raw_path,
+    receipt_path,
+    capture,
+    summary,
+    terminal_status,
+    acquisition_kind,
+    predecessor=None,
+):
+    return {
         "schema_version": RECEIPT_SCHEMA,
         "status": terminal_status,
         "source": {"endpoint": ENDPOINT, "method": "POST", "query_type": "fundingHistory"},
         "request": {
             "path": str(request_path),
-            "sha256": _sha256_bytes(request_bytes),
-            "coin": coin,
-            "start_time_ms": start_time_ms,
-            "end_time_ms": end_time_ms,
+            "sha256": _sha256_bytes(_canonical_json_bytes(request)),
+            "coin": request["coin"],
+            "start_time_ms": request["startTime"],
+            "end_time_ms": request["endTime"] + 1,
+            "end_time_exclusive_ms": request["endTime"] + 1,
+            "wire_end_inclusive_ms": request["endTime"],
+            "boundary_policy": "source-inclusive/local-exclusive",
         },
         "authorization": {
             "id": authorization["authorization_id"],
             "sha256": authorization_sha256,
             "source_contract_sha256": authorization["source_contract_sha256"],
             "consumed_before_http": True,
+            "revision_number": authorization["revision_number"],
+            "acquisition_id": authorization["authorization_id"],
+            "acquisition_kind": acquisition_kind,
         },
         "transport": {
-            "http_requests": 1,
+            "http_requests": 0 if acquisition_kind == "OFFLINE_RECOVERY" else 1,
             "automatic_retries": 0,
             "redirects_allowed": False,
             "timeout_seconds": TIMEOUT_SECONDS,
@@ -421,8 +612,21 @@ def execute_funding_contract(
             "content_type": capture["content_type"],
             "content_encoding": capture["content_encoding"],
         },
-        "raw": {"path": str(raw_path), "sha256": capture["raw_sha256"]},
+        "raw": {
+            "path": str(raw_path),
+            "sha256": capture["raw_sha256"],
+            "reference_path": (
+                predecessor["raw_path"]
+                if predecessor
+                and capture["raw_sha256"] == predecessor["raw_sha256"]
+                else None
+            ),
+        },
         "structure": summary,
+        "revision": {
+            "predecessor_receipt_path": predecessor["receipt_path"] if predecessor else None,
+            "predecessor_receipt_sha256": predecessor["receipt_sha256"] if predecessor else None,
+        },
         "claim_boundary": {
             "raw_acquired": True,
             "completeness_proven": False,
@@ -430,17 +634,21 @@ def execute_funding_contract(
             "causal_research_ready": False,
             "strategy_authorized": False,
             "trading_authorized": False,
+            "promotable": False,
+            "downstream_allowed": False,
         },
     }
-    _publish_bytes(receipt_path, _canonical_json_bytes(receipt) + b"\n")
+
+
+def _result(receipt, target_dir, request_path, raw_path, receipt_path):
     return {
-        "status": terminal_status,
+        "status": receipt["status"],
         "output_dir": str(target_dir),
         "raw_path": str(raw_path),
         "request_path": str(request_path),
         "receipt_path": str(receipt_path),
-        "request_sha256": _sha256_bytes(request_bytes),
-        "raw_sha256": capture["raw_sha256"],
+        "request_sha256": receipt["request"]["sha256"],
+        "raw_sha256": receipt["raw"]["sha256"],
         "strategy_authorized": False,
         "trading_authorized": False,
     }
