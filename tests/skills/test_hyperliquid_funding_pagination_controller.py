@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -147,6 +148,35 @@ def make_two_pages(tmp_path: Path):
     first = capture_page(adapter, tmp_path / "first", start=1_000, end=4_000, rows=first_rows)
     second = capture_page(adapter, tmp_path / "second", start=2_000, end=4_000, rows=second_rows)
     return adapter, controller, first, second, first_rows, second_rows
+
+
+def make_legacy_root(tmp_path: Path):
+    adapter, controller, first, _second, rows, _rows2 = make_two_pages(tmp_path)
+    path = Path(first["receipt_path"])
+    receipt = json.loads(path.read_bytes())
+    receipt["authorization"].pop("adapter_sha256")
+    receipt["authorization"].pop("entrypoint_sha256")
+    path.write_bytes(canonical_bytes(receipt) + b"\n")
+    binding = receipt_binding({"receipt_path": str(path)})
+    return adapter, controller, path, binding, rows
+
+
+def make_legacy_bridge(tmp_path: Path):
+    adapter, controller, path, binding, rows = make_legacy_root(tmp_path)
+    bridge = controller.build_legacy_root_bridge(
+        legacy_receipt_path=str(path),
+        legacy_receipt_sha256=binding["file_sha256"],
+        sealed_start_time_ms=1_000,
+        sealed_end_exclusive_ms=4_000,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        controller_path=CONTROLLER_PATH,
+        verifier_path=CONTROLLER_PATH,
+    )
+    written = controller.write_legacy_root_bridge(
+        bridge, str(tmp_path / "legacy-bridge")
+    )
+    return adapter, controller, path, binding, bridge, written, rows
 
 
 def test_next_page_intent_is_offline_bounded_and_owner_authorization_free(tmp_path):
@@ -598,6 +628,19 @@ def test_legacy_receipt_code_binding_stays_review_only(tmp_path):
     receipt["authorization"].pop("entrypoint_sha256")
     path.write_bytes(canonical_bytes(receipt) + b"\n")
     binding = receipt_binding({"receipt_path": str(path)})
+    bridge = controller.build_legacy_root_bridge(
+        legacy_receipt_path=str(path),
+        legacy_receipt_sha256=binding["file_sha256"],
+        sealed_start_time_ms=1_000,
+        sealed_end_exclusive_ms=4_000,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        controller_path=CONTROLLER_PATH,
+        verifier_path=CONTROLLER_PATH,
+    )
+    bridge_written = controller.write_legacy_root_bridge(
+        bridge, str(tmp_path / "legacy-bridge")
+    )
     intent = controller.build_next_page_intent(
         predecessor_receipt_path=str(path),
         predecessor_receipt_sha256=binding["file_sha256"],
@@ -605,6 +648,10 @@ def test_legacy_receipt_code_binding_stays_review_only(tmp_path):
         sealed_end_exclusive_ms=4_000,
         adapter_path=ADAPTER_PATH,
         entrypoint_path=ENTRYPOINT_PATH,
+        legacy_bridge_path=bridge_written["bridge_path"],
+        legacy_bridge_sha256=bridge_written["bridge_file_sha256"],
+        controller_path=CONTROLLER_PATH,
+        verifier_path=CONTROLLER_PATH,
     )
     assert (
         intent["predecessor"]["code_binding_status"]
@@ -626,6 +673,289 @@ def test_legacy_receipt_code_binding_stays_review_only(tmp_path):
     assert assembled["claim_boundary"]["structural_readiness"] == (
         "LEGACY_REVIEW_REQUIRED_NO_DOWNSTREAM_PROMOTION"
     )
+
+
+def test_legacy_bridge_is_exact_root_only_and_reopens_verified(tmp_path):
+    adapter, controller, path, binding, bridge, written, rows = make_legacy_bridge(tmp_path)
+    receipt_bytes = path.read_bytes()
+    receipt = json.loads(receipt_bytes)
+    request_path = Path(receipt["request"]["path"])
+    raw_path = Path(receipt["raw"]["path"])
+    request_bytes = request_path.read_bytes()
+    raw_bytes = raw_path.read_bytes()
+    assert not (tmp_path / "unpublished").exists()
+    assert base64.b64decode(bridge["receipt"]["file_bytes_base64"]) == receipt_bytes
+    assert bridge["receipt"]["file_sha256"] == binding["file_sha256"]
+    assert bridge["raw"]["bytes"] == len(raw_bytes)
+    assert bridge["raw"]["row_count"] == len(rows)
+    assert bridge["raw"]["min_boundary_row_set_sha256"] == receipt["structure"][
+        "min_boundary_row_set_sha256"
+    ]
+    assert bridge["raw"]["max_boundary_row_set_sha256"] == receipt["structure"][
+        "max_boundary_row_set_sha256"
+    ]
+    assert bridge["raw"]["min_boundary_row_set_sha256"] == independent_row_set_hash(
+        [row for row in rows if row["time"] == min(row["time"] for row in rows)]
+    )
+    assert bridge["raw"]["max_boundary_row_set_sha256"] == independent_row_set_hash(
+        [row for row in rows if row["time"] == max(row["time"] for row in rows)]
+    )
+    assert bridge["request"]["file_sha256"] == sha256_bytes(request_bytes)
+    assert bridge["code"]["adapter_sha256"] == sha256_bytes(ADAPTER_PATH.read_bytes())
+    assert bridge["code"]["entrypoint_sha256"] == sha256_bytes(ENTRYPOINT_PATH.read_bytes())
+    assert bridge["code"]["controller_sha256"] == sha256_bytes(CONTROLLER_PATH.read_bytes())
+    assert bridge["code"]["verifier_sha256"] == sha256_bytes(CONTROLLER_PATH.read_bytes())
+    assert bridge["code"]["canonicalization_algorithm_version"] == (
+        controller.CANONICALIZATION_ALGORITHM_VERSION
+    )
+    assert bridge["code"]["boundary_hash_algorithm_version"] == (
+        controller.BOUNDARY_HASH_ALGORITHM_VERSION
+    )
+    assert bridge["provenance"]["acquired_by_current_code"] is False
+    assert bridge["provenance"]["retroactive_acquisition_provenance"] is False
+    assert bridge["provenance"]["historical_acquisition_code_provenance"] == (
+        "UNKNOWN_LEGACY"
+    )
+    assert bridge["lineage_root"] == {
+        "root_role": "LEGACY_FIRST_PAGE_ROOT_ONLY",
+        "page_number": 1,
+        "cumulative_page_count": 1,
+        "cumulative_row_count": len(rows),
+        "cumulative_raw_bytes": len(raw_bytes),
+    }
+    assert bridge["allowed_use"]["next_page_intent_only"] is True
+    assert bridge["allowed_use"]["requires_separate_owner_authorization"] is True
+    assert all(value is False for value in bridge["claim_boundary"]["semantics"].values())
+    assert all(value is False for value in bridge["claim_boundary"]["authorities"].values())
+    assert written["bridge_file_sha256"] == sha256_bytes(Path(written["bridge_path"]).read_bytes())
+    validated = controller.validate_legacy_root_bridge(
+        bridge_path=written["bridge_path"],
+        bridge_file_sha256=written["bridge_file_sha256"],
+        legacy_receipt_path=str(path),
+        legacy_receipt_sha256=binding["file_sha256"],
+        sealed_start_time_ms=1_000,
+        sealed_end_exclusive_ms=4_000,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        controller_path=CONTROLLER_PATH,
+        verifier_path=CONTROLLER_PATH,
+    )
+    assert validated == bridge
+    assert path.read_bytes() == receipt_bytes
+    assert request_path.read_bytes() == request_bytes
+    assert raw_path.read_bytes() == raw_bytes
+
+    intent = controller.build_next_page_intent(
+        predecessor_receipt_path=str(path),
+        predecessor_receipt_sha256=binding["file_sha256"],
+        sealed_start_time_ms=1_000,
+        sealed_end_exclusive_ms=4_000,
+        adapter_path=ADAPTER_PATH,
+        entrypoint_path=ENTRYPOINT_PATH,
+        legacy_bridge_path=written["bridge_path"],
+        legacy_bridge_sha256=written["bridge_file_sha256"],
+        controller_path=CONTROLLER_PATH,
+        verifier_path=CONTROLLER_PATH,
+    )
+    assert intent["page"]["page_number"] == 2
+    assert intent["network_fetch"] is False
+    assert intent["authorization_created"] is False
+
+
+def test_legacy_bridge_required_and_modern_bridge_forbidden(tmp_path):
+    _adapter, controller, legacy_path, legacy_binding, _rows = make_legacy_root(tmp_path / "legacy")
+    with pytest.raises(controller.FundingPaginationError, match="bridge_required"):
+        controller.build_next_page_intent(
+            predecessor_receipt_path=str(legacy_path),
+            predecessor_receipt_sha256=legacy_binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+        )
+    _adapter2, _controller2, modern, _second, _rows1, _rows2 = make_two_pages(
+        tmp_path / "modern"
+    )
+    modern_path = Path(modern["receipt_path"])
+    with pytest.raises(controller.FundingPaginationError, match="modern_receipt_bridge_forbidden"):
+        controller.build_next_page_intent(
+            predecessor_receipt_path=str(modern_path),
+            predecessor_receipt_sha256=sha256_bytes(modern_path.read_bytes()),
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            legacy_bridge_path=str(tmp_path / "does-not-exist.json"),
+            legacy_bridge_sha256="0" * 64,
+        )
+
+
+def test_legacy_bridge_forks_replays_and_forgery_fail_closed(tmp_path):
+    _adapter, controller, path, binding, bridge, written, _rows = make_legacy_bridge(tmp_path)
+
+    with pytest.raises(controller.FundingPaginationError, match="fork_or_collision"):
+        controller.write_legacy_root_bridge(bridge, str(tmp_path / "legacy-bridge"))
+
+    variants = [
+        (
+            "identity",
+            lambda value: value["identity"].update(raw_sha256="b" * 64),
+            "binding_mismatch",
+        ),
+        (
+            "code",
+            lambda value: value["code"].update(controller_sha256="c" * 64),
+            "binding_mismatch",
+        ),
+        (
+            "algorithm",
+            lambda value: value["code"].update(boundary_hash_algorithm_version="forged"),
+            "binding_mismatch",
+        ),
+        (
+            "boundary",
+            lambda value: value["raw"].update(min_boundary_row_set_sha256="d" * 64),
+            "binding_mismatch",
+        ),
+        (
+            "authority",
+            lambda value: value["claim_boundary"]["authorities"].update(collector=True),
+            "binding_mismatch",
+        ),
+        (
+            "acquisition",
+            lambda value: value["allowed_use"].update(proves_acquisition=True),
+            "binding_mismatch",
+        ),
+        (
+            "page",
+            lambda value: value["lineage_root"].update(page_number=2),
+            "binding_mismatch",
+        ),
+        (
+            "cursor",
+            lambda value: value["request"].update(start_time_ms=999),
+            "binding_mismatch",
+        ),
+    ]
+    for name, mutate, error in variants:
+        variant_path, variant_sha = write_intent_variant(tmp_path, bridge, f"bridge-{name}.json", mutate)
+        with pytest.raises(controller.FundingPaginationError, match=error):
+            controller.validate_legacy_root_bridge(
+                bridge_path=variant_path,
+                bridge_file_sha256=variant_sha,
+                legacy_receipt_path=str(path),
+                legacy_receipt_sha256=binding["file_sha256"],
+                sealed_start_time_ms=1_000,
+                sealed_end_exclusive_ms=4_000,
+                adapter_path=ADAPTER_PATH,
+                entrypoint_path=ENTRYPOINT_PATH,
+                controller_path=CONTROLLER_PATH,
+                verifier_path=CONTROLLER_PATH,
+            )
+
+    self_hash_path, self_hash_sha = write_intent_variant(
+        tmp_path,
+        bridge,
+        "bridge-self-hash.json",
+        lambda value: value.update(bridge_file_sha256="e" * 64),
+    )
+    with pytest.raises(controller.FundingPaginationError, match="top_level_keys_invalid"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=self_hash_path,
+            bridge_file_sha256=self_hash_sha,
+            legacy_receipt_path=str(path),
+            legacy_receipt_sha256=binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
+
+    with pytest.raises(controller.FundingPaginationError, match="file_hash_mismatch"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=written["bridge_path"],
+            bridge_file_sha256="0" * 64,
+            legacy_receipt_path=str(path),
+            legacy_receipt_sha256=binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
+
+    bridge_link = tmp_path / "bridge-link.json"
+    bridge_link.symlink_to(written["bridge_path"])
+    with pytest.raises(controller.FundingPaginationError, match="path_not_canonical_absolute"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=str(bridge_link),
+            bridge_file_sha256=written["bridge_file_sha256"],
+            legacy_receipt_path=str(path),
+            legacy_receipt_sha256=binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
+
+    duplicate_path = tmp_path / "bridge-duplicate.json"
+    duplicate_bytes = b'{"schema_version":"x","schema_version":"y"}\n'
+    duplicate_path.write_bytes(duplicate_bytes)
+    with pytest.raises(controller.FundingPaginationError, match="legacy_bridge_unreadable"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=str(duplicate_path),
+            bridge_file_sha256=sha256_bytes(duplicate_bytes),
+            legacy_receipt_path=str(path),
+            legacy_receipt_sha256=binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
+
+    swap_written = controller.write_legacy_root_bridge(bridge, str(tmp_path / "hash-swap"))
+    swap_path = Path(swap_written["bridge_path"])
+    swap_bytes = json.loads(swap_path.read_bytes())
+    swap_bytes["status"] = "FORGED"
+    swap_path.write_bytes(canonical_bytes(swap_bytes) + b"\n")
+    with pytest.raises(controller.FundingPaginationError, match="file_hash_mismatch"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=str(swap_path),
+            bridge_file_sha256=swap_written["bridge_file_sha256"],
+            legacy_receipt_path=str(path),
+            legacy_receipt_sha256=binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
+
+    _other_adapter, _other_controller, other_path, other_binding, _other_rows = make_legacy_root(
+        tmp_path / "other"
+    )
+    with pytest.raises(controller.FundingPaginationError, match="binding_mismatch"):
+        controller.validate_legacy_root_bridge(
+            bridge_path=written["bridge_path"],
+            bridge_file_sha256=written["bridge_file_sha256"],
+            legacy_receipt_path=str(other_path),
+            legacy_receipt_sha256=other_binding["file_sha256"],
+            sealed_start_time_ms=1_000,
+            sealed_end_exclusive_ms=4_000,
+            adapter_path=ADAPTER_PATH,
+            entrypoint_path=ENTRYPOINT_PATH,
+            controller_path=CONTROLLER_PATH,
+            verifier_path=CONTROLLER_PATH,
+        )
 
 
 def test_assembly_requires_exact_receipt_file_bindings_and_safety_fields(tmp_path):

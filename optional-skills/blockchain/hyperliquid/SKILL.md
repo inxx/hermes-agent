@@ -143,6 +143,18 @@ completeness remains `UNKNOWN/REVIEW_REQUIRED`. Receipts missing v2
 boundary/code hashes remain `LEGACY_RECEIPT_CODE_HASHES_NOT_RECORDED_REVIEW_REQUIRED`
 and cannot be promoted to downstream structural readiness.
 
+`build_legacy_root_bridge()` is an offline-only legacy bridge producer. It
+builds a deterministic, append-only canonical JSON bridge for an immutable
+first-page receipt but does not publish an artifact unless an explicit caller
+uses `write_legacy_root_bridge()` in a separate namespace. The bridge includes
+the exact receipt file bytes as base64 plus external file SHA binding, exact
+request/raw/source bindings, current code and algorithm versions, and an
+explicit `UNKNOWN_LEGACY` acquisition-code provenance state. Its only allowed
+use is to validate a page-1 lineage root for a next-page intent; it proves no
+acquisition, completeness, semantics, readiness, or authority, and the next
+page still requires a separately issued owner authorization. Modern receipts
+cannot use a legacy bridge.
+
 ### 3. Inspect Live Order Book
 
 ```bash

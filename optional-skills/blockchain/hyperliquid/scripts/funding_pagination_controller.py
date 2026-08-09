@@ -8,6 +8,7 @@ authorization and the existing one-request adapter.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -19,11 +20,18 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 RECEIPT_SCHEMA = "hermes.hyperliquid.funding-contract-receipt.v2"
 CONTROLLER_SCHEMA = "hermes.hyperliquid.funding-pagination-controller.v1"
 INTENT_SCHEMA = "hermes.hyperliquid.funding-pagination-intent.v1"
+LEGACY_BRIDGE_SCHEMA = "hermes.hyperliquid.funding-legacy-root-bridge.v1"
 ENDPOINT = "https://api.hyperliquid.xyz/info"
 COMMAND = "funding-contract"
 REQUIRED_FIELDS = ("coin", "fundingRate", "premium", "time")
 NEXT_START_POLICY = "overlap_predecessor_max_event_time_review_required"
 UNKNOWN_STATUS = "UNKNOWN/REVIEW_REQUIRED"
+LEGACY_BRIDGE_STATUS = "LEGACY_BRIDGED_PARTIAL_RAW_REVIEW_REQUIRED"
+BRIDGE_IDENTITY_ALGORITHM_VERSION = "legacy-receipt-exact-bindings-sha256-v1"
+CANONICALIZATION_ALGORITHM_VERSION = "json-sort-keys-compact-utf8-v1"
+BOUNDARY_HASH_ALGORITHM_VERSION = "canonical-json-row-multiset-sha256-v1"
+REQUEST_WIRE_ALGORITHM_VERSION = "fundingHistory-local-half-open-wire-inclusive-v1"
+HISTORICAL_PROVENANCE_UNKNOWN = "UNKNOWN_LEGACY"
 AUTHORITY_KEYS = (
     "collector",
     "strategy_generation",
@@ -36,6 +44,18 @@ AUTHORITY_KEYS = (
     "service_or_deployment",
     "interlock_release",
 )
+SEMANTIC_KEYS = (
+    "availability_time",
+    "cadence",
+    "causal_join",
+    "completeness",
+    "data_terms",
+    "duplicates_and_gaps",
+    "field_units",
+    "historical_revision",
+    "native_identity",
+    "timestamp_meaning",
+)
 TERMINAL_STATUSES = frozenset(
     {
         "RAW_CAPTURED_EMPTY_RESPONSE_COMPLETENESS_UNKNOWN_REVIEW_REQUIRED",
@@ -47,10 +67,136 @@ TERMINAL_STATUSES = frozenset(
 ACQUISITION_KINDS = frozenset(
     {"OFFLINE_RECOVERY", "SOURCE_ACQUISITION", "SOURCE_REOBSERVATION"}
 )
+BRIDGE_KEYS = (
+    "schema_version",
+    "status",
+    "identity",
+    "receipt",
+    "request",
+    "raw",
+    "source",
+    "code",
+    "provenance",
+    "lineage_root",
+    "claim_boundary",
+    "allowed_use",
+)
+BRIDGE_IDENTITY_KEYS = (
+    "algorithm_version",
+    "bridge_identity_sha256",
+    "legacy_receipt_file_sha256",
+    "canonical_receipt_sha256",
+    "request_file_sha256",
+    "request_canonical_sha256",
+    "request_payload_sha256",
+    "raw_sha256",
+    "source_contract_sha256",
+    "coin",
+    "start_time_ms",
+    "end_time_exclusive_ms",
+    "wire_end_inclusive_ms",
+    "raw_bytes",
+    "row_count",
+    "min_event_time",
+    "max_event_time",
+    "min_boundary_row_set_sha256",
+    "max_boundary_row_set_sha256",
+)
+BRIDGE_RECEIPT_KEYS = (
+    "path",
+    "file_sha256",
+    "canonical_sha256",
+    "schema_version",
+    "file_bytes_base64",
+)
+BRIDGE_REQUEST_KEYS = (
+    "path",
+    "file_sha256",
+    "canonical_sha256",
+    "payload_sha256",
+    "payload",
+    "coin",
+    "start_time_ms",
+    "end_time_exclusive_ms",
+    "wire_end_inclusive_ms",
+    "boundary_policy",
+)
+BRIDGE_RAW_KEYS = (
+    "path",
+    "file_sha256",
+    "bytes",
+    "row_count",
+    "min_event_time",
+    "max_event_time",
+    "min_boundary_row_set_sha256",
+    "max_boundary_row_set_sha256",
+)
+BRIDGE_SOURCE_KEYS = ("endpoint", "method", "query_type", "source_contract_sha256")
+BRIDGE_CODE_KEYS = (
+    "adapter_sha256",
+    "entrypoint_sha256",
+    "controller_sha256",
+    "verifier_sha256",
+    "canonicalization_algorithm_version",
+    "boundary_hash_algorithm_version",
+    "request_wire_algorithm_version",
+    "bridge_identity_algorithm_version",
+)
+BRIDGE_PROVENANCE_KEYS = (
+    "acquired_by_current_code",
+    "retroactive_acquisition_provenance",
+    "historical_acquisition_code_provenance",
+)
+BRIDGE_LINEAGE_KEYS = (
+    "root_role",
+    "page_number",
+    "cumulative_page_count",
+    "cumulative_row_count",
+    "cumulative_raw_bytes",
+)
+BRIDGE_CLAIM_KEYS = (
+    "completeness_status",
+    "completeness_proven",
+    "readiness",
+    "source_semantics_ready",
+    "causal_research_ready",
+    "downstream_allowed",
+    "acquisition_authorized",
+    "authorization_created",
+    "network_fetch",
+    "semantics",
+    "authorities",
+)
+BRIDGE_ALLOWED_USE_KEYS = (
+    "purpose",
+    "next_page_intent_only",
+    "requires_separate_owner_authorization",
+    "proves_acquisition",
+    "proves_completeness",
+    "proves_semantics",
+    "proves_readiness",
+)
 
 
 class FundingPaginationError(RuntimeError):
     """Fail-closed offline pagination error."""
+
+
+class _DuplicateJSONKey(ValueError):
+    """Raised when an evidence JSON object repeats a key."""
+
+
+def _strict_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJSONKey(key)
+        value[key] = item
+    return value
+
+
+def _strict_json_loads(raw: bytes) -> Any:
+    return json.loads(raw, object_pairs_hook=_strict_object)
 
 
 def _canonical_bytes(payload: Any) -> bytes:
@@ -179,8 +325,8 @@ def _add_page(cumulative: Dict[str, int], page: Dict[str, Any]) -> Dict[str, int
 def _load_json(path: Path, error: str) -> tuple[bytes, Dict[str, Any]]:
     try:
         raw = _read_regular_nofollow(path, error)
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = _strict_json_loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJSONKey) as exc:
         raise FundingPaginationError(error) from exc
     if not isinstance(value, dict):
         raise FundingPaginationError(error)
@@ -213,8 +359,8 @@ def _boundary_hashes(
     max_time: Optional[int],
 ) -> tuple[Optional[str], Optional[str]]:
     try:
-        payload = json.loads(raw_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        payload = _strict_json_loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJSONKey) as exc:
         raise FundingPaginationError("predecessor_raw_not_structurally_readable") from exc
     if not isinstance(payload, list):
         raise FundingPaginationError("predecessor_raw_not_array")
@@ -254,6 +400,7 @@ def _verify_request(receipt: Dict[str, Any]) -> Dict[str, Any]:
         raise FundingPaginationError("predecessor_request_file_canonical_mismatch")
     return {
         "path": str(request_path),
+        "file_sha256": _sha256_bytes(request_bytes),
         "sha256": request_info["sha256"],
         "payload": request_payload,
         "coin": request_info.get("coin"),
@@ -378,9 +525,11 @@ def _load_receipt(
     return {
         "path": str(path),
         "file_sha256": file_sha256,
+        "_receipt_file_bytes": raw,
         "canonical_receipt_sha256": _sha256_bytes(_canonical_bytes(receipt)),
         "raw_path": str(raw_path),
         "raw_sha256": raw_sha256,
+        "_raw_payload_bytes": raw_payload_bytes,
         "raw_bytes": raw_bytes,
         "request": request,
         "source_contract_sha256": auth["source_contract_sha256"],
@@ -395,7 +544,308 @@ def _load_receipt(
         "start_boundary_row_set_sha256": min_boundary_hash,
         "boundary_row_set_sha256": max_boundary_hash,
         "revision_number": auth.get("revision_number"),
+        "authorization": auth,
+        "source": source,
+        "status": receipt["status"],
     }
+
+
+def _require_exact_keys(value: Any, keys: Sequence[str], error: str) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise FundingPaginationError(error)
+    return value
+
+
+def _default_code_path(path: Optional[Path]) -> Path:
+    return path if path is not None else Path(__file__).resolve()
+
+
+def _bridge_identity_material(loaded: Dict[str, Any]) -> Dict[str, Any]:
+    request = loaded["request"]
+    return {
+        "algorithm_version": BRIDGE_IDENTITY_ALGORITHM_VERSION,
+        "legacy_receipt_file_sha256": loaded["file_sha256"],
+        "canonical_receipt_sha256": loaded["canonical_receipt_sha256"],
+        "request_file_sha256": request["file_sha256"],
+        "request_canonical_sha256": request["sha256"],
+        "request_payload_sha256": _sha256_bytes(_canonical_bytes(request["payload"])),
+        "raw_sha256": loaded["raw_sha256"],
+        "source_contract_sha256": loaded["source_contract_sha256"],
+        "coin": request["coin"],
+        "start_time_ms": request["start_time_ms"],
+        "end_time_exclusive_ms": request["end_time_exclusive_ms"],
+        "wire_end_inclusive_ms": request["wire_end_inclusive_ms"],
+        "raw_bytes": loaded["raw_bytes"],
+        "row_count": loaded["row_count"],
+        "min_event_time": loaded["min_event_time"],
+        "max_event_time": loaded["max_event_time"],
+        "min_boundary_row_set_sha256": loaded["min_boundary_row_set_sha256"],
+        "max_boundary_row_set_sha256": loaded["max_boundary_row_set_sha256"],
+    }
+
+
+def _build_bridge_from_loaded(
+    loaded: Dict[str, Any],
+    *,
+    sealed_start_time_ms: int,
+    sealed_end_exclusive_ms: int,
+    adapter_path: Path,
+    entrypoint_path: Path,
+    controller_path: Path,
+    verifier_path: Path,
+) -> Dict[str, Any]:
+    if loaded["code_binding_status"] != "LEGACY_RECEIPT_CODE_HASHES_NOT_RECORDED_REVIEW_REQUIRED":
+        raise FundingPaginationError("modern_receipt_bridge_forbidden")
+    if loaded["authorization"].get("adapter_sha256") is not None or loaded[
+        "authorization"
+    ].get("entrypoint_sha256") is not None:
+        raise FundingPaginationError("legacy_bridge_partial_code_binding_invalid")
+    request = loaded["request"]
+    if request["start_time_ms"] != sealed_start_time_ms:
+        raise FundingPaginationError("legacy_bridge_root_start_mismatch")
+    if request["end_time_exclusive_ms"] != sealed_end_exclusive_ms:
+        raise FundingPaginationError("legacy_bridge_root_end_mismatch")
+    if loaded["row_count"] < 0:
+        raise FundingPaginationError("legacy_bridge_row_count_invalid")
+    identity_material = _bridge_identity_material(loaded)
+    identity = dict(identity_material)
+    identity["bridge_identity_sha256"] = _sha256_bytes(_canonical_bytes(identity_material))
+    source = loaded["source"]
+    code = {
+        "adapter_sha256": _sha256_file(adapter_path),
+        "entrypoint_sha256": _sha256_file(entrypoint_path),
+        "controller_sha256": _sha256_file(controller_path),
+        "verifier_sha256": _sha256_file(verifier_path),
+        "canonicalization_algorithm_version": CANONICALIZATION_ALGORITHM_VERSION,
+        "boundary_hash_algorithm_version": BOUNDARY_HASH_ALGORITHM_VERSION,
+        "request_wire_algorithm_version": REQUEST_WIRE_ALGORITHM_VERSION,
+        "bridge_identity_algorithm_version": BRIDGE_IDENTITY_ALGORITHM_VERSION,
+    }
+    claim_boundary = {
+        "completeness_status": UNKNOWN_STATUS,
+        "completeness_proven": False,
+        "readiness": False,
+        "source_semantics_ready": False,
+        "causal_research_ready": False,
+        "downstream_allowed": False,
+        "acquisition_authorized": False,
+        "authorization_created": False,
+        "network_fetch": False,
+        "semantics": {key: False for key in SEMANTIC_KEYS},
+        "authorities": {key: False for key in AUTHORITY_KEYS},
+    }
+    return {
+        "schema_version": LEGACY_BRIDGE_SCHEMA,
+        "status": LEGACY_BRIDGE_STATUS,
+        "identity": identity,
+        "receipt": {
+            "path": loaded["path"],
+            "file_sha256": loaded["file_sha256"],
+            "canonical_sha256": loaded["canonical_receipt_sha256"],
+            "schema_version": RECEIPT_SCHEMA,
+            "file_bytes_base64": base64.b64encode(loaded["_receipt_file_bytes"]).decode(
+                "ascii"
+            ),
+        },
+        "request": {
+            "path": request["path"],
+            "file_sha256": request["file_sha256"],
+            "canonical_sha256": request["sha256"],
+            "payload_sha256": _sha256_bytes(_canonical_bytes(request["payload"])),
+            "payload": request["payload"],
+            "coin": request["coin"],
+            "start_time_ms": request["start_time_ms"],
+            "end_time_exclusive_ms": request["end_time_exclusive_ms"],
+            "wire_end_inclusive_ms": request["wire_end_inclusive_ms"],
+            "boundary_policy": "source-inclusive/local-exclusive",
+        },
+        "raw": {
+            "path": loaded["raw_path"],
+            "file_sha256": loaded["raw_sha256"],
+            "bytes": loaded["raw_bytes"],
+            "row_count": loaded["row_count"],
+            "min_event_time": loaded["min_event_time"],
+            "max_event_time": loaded["max_event_time"],
+            "min_boundary_row_set_sha256": loaded["min_boundary_row_set_sha256"],
+            "max_boundary_row_set_sha256": loaded["max_boundary_row_set_sha256"],
+        },
+        "source": {
+            "endpoint": source["endpoint"],
+            "method": source["method"],
+            "query_type": source["query_type"],
+            "source_contract_sha256": loaded["source_contract_sha256"],
+        },
+        "code": code,
+        "provenance": {
+            "acquired_by_current_code": False,
+            "retroactive_acquisition_provenance": False,
+            "historical_acquisition_code_provenance": HISTORICAL_PROVENANCE_UNKNOWN,
+        },
+        "lineage_root": {
+            "root_role": "LEGACY_FIRST_PAGE_ROOT_ONLY",
+            "page_number": 1,
+            "cumulative_page_count": 1,
+            "cumulative_row_count": loaded["row_count"],
+            "cumulative_raw_bytes": loaded["raw_bytes"],
+        },
+        "claim_boundary": claim_boundary,
+        "allowed_use": {
+            "purpose": "OFFLINE_NEXT_PAGE_INTENT_LINEAGE_ROOT_ONLY",
+            "next_page_intent_only": True,
+            "requires_separate_owner_authorization": True,
+            "proves_acquisition": False,
+            "proves_completeness": False,
+            "proves_semantics": False,
+            "proves_readiness": False,
+        },
+    }
+
+
+def _validate_bridge_shape(bridge: Dict[str, Any]) -> None:
+    _require_exact_keys(bridge, BRIDGE_KEYS, "legacy_bridge_top_level_keys_invalid")
+    if bridge["schema_version"] != LEGACY_BRIDGE_SCHEMA:
+        raise FundingPaginationError("legacy_bridge_schema_invalid")
+    if bridge["status"] != LEGACY_BRIDGE_STATUS:
+        raise FundingPaginationError("legacy_bridge_status_invalid")
+    _require_exact_keys(bridge["identity"], BRIDGE_IDENTITY_KEYS, "legacy_bridge_identity_keys_invalid")
+    _require_exact_keys(bridge["receipt"], BRIDGE_RECEIPT_KEYS, "legacy_bridge_receipt_keys_invalid")
+    _require_exact_keys(bridge["request"], BRIDGE_REQUEST_KEYS, "legacy_bridge_request_keys_invalid")
+    _require_exact_keys(bridge["raw"], BRIDGE_RAW_KEYS, "legacy_bridge_raw_keys_invalid")
+    _require_exact_keys(bridge["source"], BRIDGE_SOURCE_KEYS, "legacy_bridge_source_keys_invalid")
+    _require_exact_keys(bridge["code"], BRIDGE_CODE_KEYS, "legacy_bridge_code_keys_invalid")
+    _require_exact_keys(
+        bridge["provenance"], BRIDGE_PROVENANCE_KEYS, "legacy_bridge_provenance_keys_invalid"
+    )
+    _require_exact_keys(bridge["lineage_root"], BRIDGE_LINEAGE_KEYS, "legacy_bridge_lineage_keys_invalid")
+    claim = _require_exact_keys(
+        bridge["claim_boundary"], BRIDGE_CLAIM_KEYS, "legacy_bridge_claim_keys_invalid"
+    )
+    _require_exact_keys(claim["semantics"], SEMANTIC_KEYS, "legacy_bridge_semantics_keys_invalid")
+    _require_exact_keys(claim["authorities"], AUTHORITY_KEYS, "legacy_bridge_authorities_keys_invalid")
+    _require_exact_keys(
+        bridge["allowed_use"], BRIDGE_ALLOWED_USE_KEYS, "legacy_bridge_allowed_use_keys_invalid"
+    )
+
+
+def _load_bridge_file(path_value: str, expected_file_sha256: str) -> tuple[bytes, Dict[str, Any]]:
+    if not _is_sha256(expected_file_sha256):
+        raise FundingPaginationError("legacy_bridge_file_sha256_invalid")
+    path = _absolute_path(path_value)
+    raw, bridge = _load_json(path, "legacy_bridge_unreadable")
+    if _sha256_bytes(raw) != expected_file_sha256:
+        raise FundingPaginationError("legacy_bridge_file_hash_mismatch")
+    if raw != _canonical_bytes(bridge) + b"\n":
+        raise FundingPaginationError("legacy_bridge_not_canonical_newline")
+    _validate_bridge_shape(bridge)
+    return raw, bridge
+
+
+def build_legacy_root_bridge(
+    *,
+    legacy_receipt_path: str,
+    legacy_receipt_sha256: str,
+    sealed_start_time_ms: int,
+    sealed_end_exclusive_ms: int,
+    adapter_path: Path,
+    entrypoint_path: Path,
+    controller_path: Optional[Path] = None,
+    verifier_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build a legacy root bridge in memory; never writes an artifact."""
+    if not _is_sha256(legacy_receipt_sha256):
+        raise FundingPaginationError("legacy_receipt_sha256_invalid")
+    controller = _default_code_path(controller_path)
+    verifier = _default_code_path(verifier_path)
+    loaded = _load_receipt(
+        legacy_receipt_path,
+        expected_file_sha256=legacy_receipt_sha256,
+        adapter_path=adapter_path,
+        entrypoint_path=entrypoint_path,
+    )
+    bridge = _build_bridge_from_loaded(
+        loaded,
+        sealed_start_time_ms=sealed_start_time_ms,
+        sealed_end_exclusive_ms=sealed_end_exclusive_ms,
+        adapter_path=adapter_path,
+        entrypoint_path=entrypoint_path,
+        controller_path=controller,
+        verifier_path=verifier,
+    )
+    _validate_bridge_shape(bridge)
+    return bridge
+
+
+def write_legacy_root_bridge(bridge: Dict[str, Any], output_root: str) -> Dict[str, Any]:
+    """Write one deterministic bridge namespace with O_EXCL and re-open verify."""
+    _validate_bridge_shape(bridge)
+    root = _absolute_path(output_root)
+    if root.exists() and root.is_symlink():
+        raise FundingPaginationError("legacy_bridge_output_root_symlink_rejected")
+    root.mkdir(parents=True, exist_ok=True)
+    receipt_sha256 = bridge["identity"]["legacy_receipt_file_sha256"]
+    if not _is_sha256(receipt_sha256):
+        raise FundingPaginationError("legacy_bridge_receipt_identity_invalid")
+    if bridge["receipt"]["file_sha256"] != receipt_sha256:
+        raise FundingPaginationError("legacy_bridge_receipt_identity_mismatch")
+    try:
+        receipt_bytes = base64.b64decode(
+            bridge["receipt"]["file_bytes_base64"], validate=True
+        )
+    except (ValueError, TypeError) as exc:
+        raise FundingPaginationError("legacy_bridge_receipt_base64_invalid") from exc
+    if _sha256_bytes(receipt_bytes) != receipt_sha256:
+        raise FundingPaginationError("legacy_bridge_receipt_bytes_hash_mismatch")
+    namespace = root / f"legacy-receipt-{receipt_sha256}"
+    try:
+        namespace.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise FundingPaginationError("legacy_bridge_fork_or_collision") from exc
+    bridge_path = namespace / "bridge.json"
+    bridge_bytes = _canonical_bytes(bridge) + b"\n"
+    _exclusive_publish(bridge_path, bridge_bytes)
+    reopened = _read_regular_nofollow(bridge_path, "legacy_bridge_reopen_failed")
+    if reopened != bridge_bytes:
+        raise FundingPaginationError("legacy_bridge_reopen_bytes_mismatch")
+    reopened_json = _strict_json_loads(reopened)
+    if reopened_json != bridge or reopened != _canonical_bytes(reopened_json) + b"\n":
+        raise FundingPaginationError("legacy_bridge_reopen_canonical_mismatch")
+    return {
+        "bridge_path": str(bridge_path),
+        "bridge_file_sha256": _sha256_bytes(reopened),
+        "namespace": str(namespace),
+    }
+
+
+def validate_legacy_root_bridge(
+    *,
+    bridge_path: str,
+    bridge_file_sha256: str,
+    legacy_receipt_path: str,
+    legacy_receipt_sha256: str,
+    sealed_start_time_ms: int,
+    sealed_end_exclusive_ms: int,
+    adapter_path: Path,
+    entrypoint_path: Path,
+    controller_path: Optional[Path] = None,
+    verifier_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Validate external bridge bytes and all legacy immutable bindings."""
+    _raw_bridge, bridge = _load_bridge_file(bridge_path, bridge_file_sha256)
+    expected_bridge = build_legacy_root_bridge(
+        legacy_receipt_path=legacy_receipt_path,
+        legacy_receipt_sha256=legacy_receipt_sha256,
+        sealed_start_time_ms=sealed_start_time_ms,
+        sealed_end_exclusive_ms=sealed_end_exclusive_ms,
+        adapter_path=adapter_path,
+        entrypoint_path=entrypoint_path,
+        controller_path=controller_path,
+        verifier_path=verifier_path,
+    )
+    if bridge != expected_bridge:
+        raise FundingPaginationError("legacy_bridge_binding_mismatch")
+    if "bridge_file_sha256" in bridge or "self_hash" in bridge:
+        raise FundingPaginationError("legacy_bridge_self_hash_not_authoritative")
+    return bridge
 
 
 def _load_intent_lineage(
@@ -627,6 +1077,10 @@ def build_next_page_intent(
     sealed_end_exclusive_ms: int,
     adapter_path: Path,
     entrypoint_path: Path,
+    legacy_bridge_path: Optional[str] = None,
+    legacy_bridge_sha256: Optional[str] = None,
+    controller_path: Optional[Path] = None,
+    verifier_path: Optional[Path] = None,
     predecessor_intent_path: Optional[str] = None,
     predecessor_intent_sha256: Optional[str] = None,
     max_pages: int = 128,
@@ -658,6 +1112,30 @@ def build_next_page_intent(
     )
     adapter_sha256 = predecessor["adapter_sha256"]
     entrypoint_sha256 = predecessor["entrypoint_sha256"]
+    controller = _default_code_path(controller_path)
+    verifier = _default_code_path(verifier_path)
+    bridge_supplied = legacy_bridge_path is not None or legacy_bridge_sha256 is not None
+    if predecessor["code_binding_status"] == (
+        "LEGACY_RECEIPT_CODE_HASHES_NOT_RECORDED_REVIEW_REQUIRED"
+    ):
+        if not bridge_supplied or legacy_bridge_path is None or legacy_bridge_sha256 is None:
+            raise FundingPaginationError("legacy_root_bridge_required")
+        bridge = validate_legacy_root_bridge(
+            bridge_path=legacy_bridge_path,
+            bridge_file_sha256=legacy_bridge_sha256,
+            legacy_receipt_path=predecessor_receipt_path,
+            legacy_receipt_sha256=predecessor_receipt_sha256,
+            sealed_start_time_ms=sealed_start_time_ms,
+            sealed_end_exclusive_ms=sealed_end_exclusive_ms,
+            adapter_path=adapter_path,
+            entrypoint_path=entrypoint_path,
+            controller_path=controller,
+            verifier_path=verifier,
+        )
+        if bridge["lineage_root"]["page_number"] != 1:
+            raise FundingPaginationError("legacy_bridge_not_first_page_root")
+    elif bridge_supplied:
+        raise FundingPaginationError("modern_receipt_bridge_forbidden")
     if (predecessor_intent_path is None) != (predecessor_intent_sha256 is None):
         raise FundingPaginationError("predecessor_intent_lineage_incomplete")
     if predecessor_intent_path is None:
