@@ -128,15 +128,20 @@ parsing. Its receipt never claims completeness, causal research readiness,
 strategy authority, or trading authority.
 
 `funding_pagination_controller.py` is an offline-only bounded pagination
-controller. It consumes immutable receipts, verifies receipt/request/raw/source
-hash bindings, and emits a review-required next-page intent with
+controller. It consumes immutable receipts, verifies exact receipt-file,
+request, raw, and source bindings through single `O_NOFOLLOW` regular-file
+reads, and emits a review-required next-page intent with
 `network_fetch=false`; it never creates an authorization or opens a socket.
 The cursor is the predecessor maximum event time (not `last_time + 1`) so
-boundary rows are intentionally overlapped. Raw pages are never merged or
-deduplicated. A later aggregate contains only page hashes, row counts, byte
-counts, and time bounds; boundary row-set identity ambiguity, empty pages,
-limits, cycles, and no-progress stop fail closed while completeness remains
-`UNKNOWN/REVIEW_REQUIRED`.
+boundary rows are intentionally overlapped. Page numbers and cumulative
+page/row/byte limits come only from an exact-SHA intent lineage anchored at
+page 1; caller-supplied page numbers and path-only assembly are rejected. Raw
+pages are never merged or deduplicated. A later aggregate contains only page
+hashes, row counts, byte counts, and time bounds; boundary row-set identity
+ambiguity, empty pages, limits, cycles, and no-progress stop fail closed while
+completeness remains `UNKNOWN/REVIEW_REQUIRED`. Receipts missing v2
+boundary/code hashes remain `LEGACY_RECEIPT_CODE_HASHES_NOT_RECORDED_REVIEW_REQUIRED`
+and cannot be promoted to downstream structural readiness.
 
 ### 3. Inspect Live Order Book
 
