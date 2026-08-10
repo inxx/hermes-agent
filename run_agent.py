@@ -4751,9 +4751,19 @@ class AIAgent:
             # NO_PROXY resolution.
             _mounts = {}
             if _proxy is None:
+                from agent.provider_wire_instrumentation import (
+                    instrument_httpx_transport,
+                )
+
                 _mounts = {
-                    "http://": _httpx.HTTPTransport(verify=verify),
-                    "https://": _httpx.HTTPTransport(verify=verify),
+                    "http://": instrument_httpx_transport(
+                        _httpx.HTTPTransport(verify=verify, retries=0),
+                        transport_role="primary",
+                    ),
+                    "https://": instrument_httpx_transport(
+                        _httpx.HTTPTransport(verify=verify, retries=0),
+                        transport_role="primary",
+                    ),
                 }
             return _httpx.Client(
                 limits=_limits,
@@ -4952,6 +4962,7 @@ class AIAgent:
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
+        from agent.provider_wire_instrumentation import current_provider_wire_recorder
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa":
@@ -4960,6 +4971,7 @@ class AIAgent:
             return primary_client
         with self._openai_client_lock():
             request_kwargs = dict(self._client_kwargs)
+        wire_evidence_active = current_provider_wire_recorder() is not None
         # Per-request OpenAI-wire clients (used by both the non-streaming
         # chat-completions path and the streaming chat-completions path
         # in `_interruptible_api_call`) should not run the SDK's built-in
@@ -4989,7 +5001,8 @@ class AIAgent:
             cached = cache["client"]
             if cached is not None and not cache["in_use"]:
                 if (
-                    not cache["poisoned"]
+                    not wire_evidence_active
+                    and not cache["poisoned"]
                     and cache["kwargs"] == request_kwargs
                     and not self._is_openai_client_closed(cached)
                 ):
@@ -5008,6 +5021,13 @@ class AIAgent:
             # with an in-flight request on another thread).
             self._close_openai_client(stale, reason=f"reuse_evict:{reason}", shared=False)
         client = self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        if wire_evidence_active:
+            # The transport closes over this request's recorder.  Never put
+            # it in the cross-turn warm-client cache: a later uninstrumented
+            # or differently-correlated request must not reuse or mutate the
+            # previous request's evidence context.  As an untracked client it
+            # is closed by _close_request_openai_client even on clean success.
+            return client
         with self._openai_client_lock():
             cache = self._request_client_cache_ref()
             if cache["client"] is None:

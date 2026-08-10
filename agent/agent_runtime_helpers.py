@@ -2242,12 +2242,28 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # copy locks the contract so future transport/keepalive work can't reintroduce
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
+    from agent.provider_wire_instrumentation import (
+        ProviderWireEvidenceError,
+        current_provider_wire_recorder,
+    )
+
+    wire_evidence_active = current_provider_wire_recorder() is not None
+    if wire_evidence_active and "http_client" in client_kwargs:
+        # A caller-owned client can bypass the owned direct HTTPX transports,
+        # so its sends cannot satisfy the exact one-attempt contract.
+        raise ProviderWireEvidenceError(
+            "provider_wire_custom_http_client_unsupported"
+        )
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+        if wire_evidence_active:
+            raise ProviderWireEvidenceError(
+                "provider_wire_non_httpx_transport_unsupported"
+            )
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
@@ -2263,6 +2279,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
 
         base_url = str(client_kwargs.get("base_url", "") or "")
         if is_native_gemini_base_url(base_url):
+            if wire_evidence_active:
+                raise ProviderWireEvidenceError(
+                    "provider_wire_non_httpx_transport_unsupported"
+                )
             safe_kwargs = {
                 k: v for k, v in client_kwargs.items()
                 if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
@@ -2312,7 +2332,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # OpenAI/aggregator client passes through (init, switch_model, recovery,
     # restore, request-scoped); auxiliary_client builds its own clients and keeps
     # SDK retries because it is NOT wrapped by the conversation loop.
-    client_kwargs.setdefault("max_retries", 0)
+    if wire_evidence_active:
+        client_kwargs["max_retries"] = 0
+    else:
+        client_kwargs.setdefault("max_retries", 0)
     # Defense-in-depth: guarantee Copilot requests carry the integration
     # headers regardless of which build path we came through. The primary
     # header wiring lives in `_apply_client_headers_for_base_url`, but two

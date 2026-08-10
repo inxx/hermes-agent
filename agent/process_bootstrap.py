@@ -186,9 +186,25 @@ def build_keepalive_http_client(
         client_cls = httpx.AsyncClient if async_mode else httpx.Client
         mounts = {}
         if proxy is None:
+            from agent.provider_wire_instrumentation import (
+                instrument_async_httpx_transport,
+                instrument_httpx_transport,
+            )
+
+            wrap_transport = (
+                instrument_async_httpx_transport
+                if async_mode
+                else instrument_httpx_transport
+            )
             mounts = {
-                "http://": transport_cls(verify=verify),
-                "https://": transport_cls(verify=verify),
+                "http://": wrap_transport(
+                    transport_cls(verify=verify, retries=0),
+                    transport_role="auxiliary",
+                ),
+                "https://": wrap_transport(
+                    transport_cls(verify=verify, retries=0),
+                    transport_role="auxiliary",
+                ),
             }
         return client_cls(
             limits=limits,

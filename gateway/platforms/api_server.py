@@ -93,6 +93,13 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
+from agent.provider_wire_instrumentation import (
+    PROVIDER_WIRE_EVIDENCE_HEADER,
+    ProviderWireEvidenceError,
+    ProviderWireRecorder,
+    bind_provider_wire_recorder,
+    sanitized_provider_wire_evidence,
+)
 from gateway.readiness import collect_runtime_readiness
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -3858,6 +3865,45 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        provider_wire_recorder = None
+        provider_wire_nonce = request.headers.get(PROVIDER_WIRE_EVIDENCE_HEADER)
+        if provider_wire_nonce is not None:
+            # The evidence mode can constrain provider execution and therefore
+            # is available only on a configured, authenticated listener.  The
+            # decorator already validated the bearer token; this additional
+            # guard closes the historical no-key test/manual-listener path.
+            if not self._expected_api_key():
+                return web.json_response(
+                    _openai_error(
+                        "provider_wire_evidence_requires_authenticated_gateway",
+                        code="provider_wire_evidence_auth_required",
+                    ),
+                    status=403,
+                )
+            if stream:
+                return web.json_response(
+                    _openai_error(
+                        "provider_wire_evidence_requires_nonstreaming_request",
+                        code="provider_wire_evidence_stream_unsupported",
+                    ),
+                    status=400,
+                )
+            if request.headers.get("Idempotency-Key"):
+                return web.json_response(
+                    _openai_error(
+                        "provider_wire_evidence_forbids_idempotency_cache",
+                        code="provider_wire_evidence_idempotency_forbidden",
+                    ),
+                    status=400,
+                )
+            try:
+                provider_wire_recorder = ProviderWireRecorder(provider_wire_nonce)
+            except ProviderWireEvidenceError as exc:
+                return web.json_response(
+                    _openai_error(str(exc), code="provider_wire_evidence_invalid"),
+                    status=400,
+                )
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -4081,7 +4127,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
+            run_kwargs = dict(
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
@@ -4090,6 +4136,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 **agent_overrides,
                 route=route,
             )
+            if provider_wire_recorder is not None:
+                run_kwargs["provider_wire_recorder"] = provider_wire_recorder
+            return await self._run_agent(**run_kwargs)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
@@ -4101,19 +4150,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
+                public_error = (
+                    _redact_api_error_text(e)
+                    if provider_wire_recorder is not None
+                    else f"Internal server error: {e}"
                 )
+                error_body = _openai_error(
+                    public_error, err_type="server_error"
+                )
+                evidence = sanitized_provider_wire_evidence(
+                    provider_wire_recorder, terminal_success=False
+                )
+                if evidence is not None:
+                    error_body["error"]["hermes"] = {
+                        "provider_wire_evidence": evidence
+                    }
+                return web.json_response(error_body, status=500)
         else:
             try:
                 result, usage = await _compute_completion()
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
+                public_error = (
+                    _redact_api_error_text(e)
+                    if provider_wire_recorder is not None
+                    else f"Internal server error: {e}"
                 )
+                error_body = _openai_error(
+                    public_error, err_type="server_error"
+                )
+                evidence = sanitized_provider_wire_evidence(
+                    provider_wire_recorder, terminal_success=False
+                )
+                if evidence is not None:
+                    error_body["error"]["hermes"] = {
+                        "provider_wire_evidence": evidence
+                    }
+                return web.json_response(error_body, status=500)
 
         final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
         is_partial = bool(result.get("partial"))
@@ -4152,6 +4225,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
             }
+            evidence = sanitized_provider_wire_evidence(
+                provider_wire_recorder, terminal_success=False
+            )
+            if evidence is not None:
+                err_body["error"]["hermes"]["provider_wire_evidence"] = evidence
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             return web.json_response(err_body, status=502, headers=response_headers)
@@ -4192,6 +4270,15 @@ class APIServerAdapter(BasePlatformAdapter):
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+
+        evidence = sanitized_provider_wire_evidence(
+            provider_wire_recorder,
+            terminal_success=not (is_partial or is_failed or not completed),
+        )
+        if evidence is not None:
+            response_data.setdefault("hermes", {})[
+                "provider_wire_evidence"
+            ] = evidence
 
         return web.json_response(response_data, headers=response_headers)
 
@@ -5932,6 +6019,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        provider_wire_recorder: Optional[ProviderWireRecorder] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5967,7 +6055,12 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import clear_session_vars
 
-            with self._profile_scope(request_profile):
+            wire_scope = (
+                bind_provider_wire_recorder(provider_wire_recorder)
+                if provider_wire_recorder is not None
+                else nullcontext()
+            )
+            with wire_scope, self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
@@ -5990,6 +6083,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
                     )
+                    if provider_wire_recorder is not None:
+                        provider_wire_recorder.require_registered_transport()
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
