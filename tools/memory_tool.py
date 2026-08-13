@@ -67,6 +67,32 @@ MEMORY_BLOCK_HEADERS = {
 ENTRY_DELIMITER = "\n§\n"
 
 
+def memory_mutation_target_allowed(target: str) -> bool:
+    """Return whether config permits mutations for ``target``.
+
+    ``mutable_targets`` is optional for backward compatibility. Once present,
+    malformed or empty values fail closed so an approval replay cannot widen a
+    managed profile's write surface.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        memory_config = (load_config_readonly() or {}).get("memory", {}) or {}
+    except Exception:
+        return False
+    if "mutable_targets" not in memory_config:
+        return True
+    raw_targets = memory_config.get("mutable_targets")
+    if not isinstance(raw_targets, (list, tuple, set)) or not raw_targets:
+        return False
+    allowed_targets = {
+        item.strip().lower()
+        for item in raw_targets
+        if isinstance(item, str) and item.strip()
+    }
+    return str(target or "").strip().lower() in allowed_targets
+
+
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
@@ -1073,6 +1099,11 @@ def memory_tool(
 
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if not memory_mutation_target_allowed(target):
+        return tool_error(
+            f"Memory target '{target}' is read-only in this profile.",
+            success=False,
+        )
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1135,6 +1166,8 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     """
     action = payload.get("action")
     target = payload.get("target", "memory")
+    if target not in {"memory", "user"} or not memory_mutation_target_allowed(target):
+        return {"success": False, "error": f"Memory target '{target}' is read-only in this profile."}
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
@@ -1234,7 +1267,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
 
 

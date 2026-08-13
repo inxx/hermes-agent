@@ -3449,6 +3449,13 @@ class GatewaySlashCommandsMixin:
             # not be persisted back to the user's file).
             from hermes_cli.config import read_user_config_raw
             user_config = read_user_config_raw(config_path)
+            memory_config = user_config.get("memory", {})
+            if (
+                not enabled
+                and isinstance(memory_config, dict)
+                and memory_config.get("write_approval_locked") is True
+            ):
+                raise ValueError("memory approval is locked on by managed policy")
             user_config.setdefault("memory", {})["write_approval"] = bool(enabled)
             atomic_config_write(config_path, user_config)
             # New setting must take effect next message → drop cached agent.
