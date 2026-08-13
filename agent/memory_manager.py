@@ -47,6 +47,42 @@ _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
 
 
+def resolve_builtin_memory_flags(
+    memory_config: Any,
+    platform: Optional[str],
+) -> tuple[bool, bool]:
+    """Resolve built-in memory flags for the current platform.
+
+    ``enabled_platforms`` is an optional, fail-closed allowlist.  Omitting it
+    preserves the historical global behavior so existing installations remain
+    backward compatible.  Once the key is present, malformed or empty values
+    disable built-in memory rather than broadening its scope accidentally.
+    """
+    if not isinstance(memory_config, dict):
+        return False, False
+
+    memory_enabled = bool(memory_config.get("memory_enabled", False))
+    user_profile_enabled = bool(memory_config.get("user_profile_enabled", False))
+
+    if "enabled_platforms" not in memory_config:
+        return memory_enabled, user_profile_enabled
+
+    raw_platforms = memory_config.get("enabled_platforms")
+    if not isinstance(raw_platforms, (list, tuple, set)) or not raw_platforms:
+        return False, False
+
+    allowed_platforms = {
+        item.strip().lower()
+        for item in raw_platforms
+        if isinstance(item, str) and item.strip()
+    }
+    current_platform = str(platform or "cli").strip().lower()
+    if not allowed_platforms or current_platform not in allowed_platforms:
+        return False, False
+
+    return memory_enabled, user_profile_enabled
+
+
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     """Return a function-tool dict with a resolvable top-level ``name``.
 
